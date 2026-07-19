@@ -1,24 +1,26 @@
 'use server';
 
 import { revalidatePath } from 'next/cache';
-import { supabase } from '@/app/lib/supabase';
+import { supabase } from '@/library/supabaseClient';
 
 export async function createItem(formData: FormData) {
   const name = formData.get('name')?.toString() || '';
   const sku = formData.get('sku')?.toString() || '';
-  const categoryId = formData.get('categoryId')?.toString() || null;
+  const category = formData.get('category')?.toString() || '';
   const size = formData.get('size')?.toString() || '';
-  const currentStock = Number(formData.get('currentStock') || 0);
-  const threshold = Number(formData.get('lowStockThreshold') || 5);
+  const stock = Number(formData.get('stock') || 0);
+  const min = Number(formData.get('min') || 5);
   const colors = formData.get('colors')?.toString().split(',').filter(Boolean) || [];
+  const status = stock <= min ? 'LOW' : 'OK';
 
-  const { error } = await supabase.from('items').insert({
+  const { error } = await supabase.from('inventory').insert({
     name,
     sku,
-    category_id: categoryId,
+    category,
     size,
-    current_stock: currentStock,
-    low_stock_threshold: threshold,
+    stock,
+    min,
+    status,
     colors,
   });
 
@@ -27,33 +29,29 @@ export async function createItem(formData: FormData) {
 }
 
 export async function adjustStock(itemId: string, delta: number) {
-  const { data, error } = await supabase.from('items').select('current_stock').eq('id', itemId).single();
+  const { data, error } = await supabase.from('inventory').select('stock, min').eq('id', itemId).single();
 
   if (error || !data) throw error || new Error('Item not found');
 
-  const nextStock = data.current_stock + delta;
-  const { error: updateError } = await supabase.from('items').update({ current_stock: nextStock, updated_at: new Date().toISOString() }).eq('id', itemId);
+  const nextStock = Math.max(0, data.stock + delta);
+  const status = nextStock <= data.min ? 'LOW' : 'OK';
+
+  const { error: updateError } = await supabase
+    .from('inventory')
+    .update({ stock: nextStock, status })
+    .eq('id', itemId);
 
   if (updateError) throw updateError;
-
-  await supabase.from('audit_logs').insert({
-    item_id: itemId,
-    action: 'STOCK_ADJUST',
-    previous_stock: data.current_stock,
-    new_stock: nextStock,
-    timestamp: new Date().toISOString(),
-  });
 
   revalidatePath('/');
 }
 
 export async function exportInventory(format: 'csv' | 'xlsx') {
-  const { data, error } = await supabase.from('items').select('name, sku, current_stock, low_stock_threshold, size, colors, category_id');
+  const { data, error } = await supabase.from('inventory').select('name, sku, stock, min, size, colors, category, status');
   if (error) throw error;
 
   if (format === 'csv') {
-    const csv = data.map((item) => `${item.name},${item.sku},${item.current_stock}`).join('\n');
-    return csv;
+    return data.map((item) => `${item.name},${item.sku},${item.stock}`).join('\n');
   }
 
   return JSON.stringify(data);
