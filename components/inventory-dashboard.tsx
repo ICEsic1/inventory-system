@@ -1,6 +1,7 @@
 'use client';
 
-import { useMemo, useState } from 'react';
+import { supabase } from '@/library/supabaseClient';
+import { useEffect, useMemo, useState } from 'react';
 import { BarChart3, Box, Circle, Download, Edit3, Package2, Plus, Search, Trash2, TrendingUp, Warehouse } from 'lucide-react';
 import { ResponsiveContainer, BarChart, Bar, XAxis, YAxis, Tooltip, CartesianGrid } from 'recharts';
 import Papa from 'papaparse';
@@ -31,12 +32,6 @@ type Category = {
   name: string;
 };
 
-const initialItems: InventoryItem[] = [
-  { id: '1', name: 'Premium Tee', sku: 'PT-001', category: 'Shirts', size: 'M', stock: 8, min: 10, status: 'LOW', colors: ['Black', 'White'] },
-  { id: '2', name: 'Classic Shirt', sku: 'CS-200', category: 'Shirts', size: 'L', stock: 24, min: 8, status: 'OK', colors: ['Navy', 'Cream'] },
-  { id: '3', name: 'Tailored Jacket', sku: 'TJ-310', category: 'Jackets', size: 'XL', stock: 3, min: 6, status: 'LOW', colors: ['Olive', 'Black'] },
-];
-
 const initialCategories: Category[] = [
   { id: 'cat-1', name: 'Shirts' },
   { id: 'cat-2', name: 'Jackets' },
@@ -45,15 +40,8 @@ const initialCategories: Category[] = [
 
 const colorOptions = ['Black', 'White', 'Navy', 'Olive', 'Cream', 'Red', 'Khaki'];
 
-const chartData = [
-  { category: 'Shirts', stock: 32 },
-  { category: 'Jackets', stock: 12 },
-  { category: 'Accessories', stock: 18 },
-  { category: 'Footwear', stock: 9 },
-];
-
 export default function InventoryDashboard() {
-  const [items, setItems] = useState<InventoryItem[]>(initialItems);
+  const [items, setItems] = useState<InventoryItem[]>([]);
   const [categories, setCategories] = useState<Category[]>(initialCategories);
   const [query, setQuery] = useState('');
   const [statusFilter, setStatusFilter] = useState('ALL');
@@ -62,21 +50,67 @@ export default function InventoryDashboard() {
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [form, setForm] = useState({ name: '', sku: '', category: 'Shirts', size: 'M', stock: '0', min: '5', colors: [] as string[] });
-  const [auditLog, setAuditLog] = useState<AuditEntry[]>([
-    { id: 'a1', action: 'STOCK_ADJUST', item: 'Premium Tee', detail: '+1 to 9', time: '8 min ago' },
-    { id: 'a2', action: 'CREATE', item: 'Tailored Jacket', detail: 'New item added', time: '30 min ago' },
-    { id: 'a3', action: 'UPDATE', item: 'Classic Shirt', detail: 'Threshold updated', time: '1 hr ago' },
-  ]);
+  const [auditLog, setAuditLog] = useState<AuditEntry[]>([]);
   const [newCategory, setNewCategory] = useState('');
+
+  // 1. Fetch Inventory from Supabase on Load & Subscribe to Realtime Updates
+  useEffect(() => {
+    async function fetchInventory() {
+      const { data, error } = await supabase.from('inventory').select('*').order('created_at', { ascending: false });
+      if (error) {
+        console.error('Error fetching inventory:', error);
+      } else if (data) {
+        // Map database columns to component properties
+        const formattedItems: InventoryItem[] = data.map((row) => ({
+          id: String(row.id),
+          name: row.name || '',
+          sku: row.sku || '',
+          category: row.category || '',
+          size: row.size || 'M',
+          stock: Number(row.stock ?? row.quantity ?? 0),
+          min: Number(row.min ?? 5),
+          status: row.status || (Number(row.stock ?? 0) <= Number(row.min ?? 5) ? 'LOW' : 'OK'),
+          colors: Array.isArray(row.colors) ? row.colors : [],
+        }));
+        setItems(formattedItems);
+      }
+    }
+
+    fetchInventory();
+
+    // Subscribe to realtime database changes across all devices
+    const channel = supabase
+      .channel('inventory_changes')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'inventory' }, () => {
+        fetchInventory();
+      })
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, []);
 
   const filteredItems = useMemo(() => {
     return items.filter((item) => {
-      const matchesQuery = `${item.name} ${item.sku} ${item.colors.join(' ')}`.toLowerCase().includes(query.toLowerCase());
+      const matchesQuery = `${item.name} ${item.sku} ${(item.colors || []).join(' ')}`.toLowerCase().includes(query.toLowerCase());
       const matchesStatus = statusFilter === 'ALL' || item.status === statusFilter;
       const matchesCategory = categoryFilter === 'ALL' || item.category === categoryFilter;
       return matchesQuery && matchesStatus && matchesCategory;
     });
   }, [items, query, statusFilter, categoryFilter]);
+
+  // Compute stock counts dynamically by category for chart
+  const chartData = useMemo(() => {
+    const categoryTotals: Record<string, number> = {};
+    items.forEach((item) => {
+      categoryTotals[item.category] = (categoryTotals[item.category] || 0) + item.stock;
+    });
+    return Object.keys(categoryTotals).map((cat) => ({
+      category: cat,
+      stock: categoryTotals[cat],
+    }));
+  }, [items]);
 
   const totalValue = items.reduce((sum, item) => sum + item.stock * 80, 0);
   const lowStockCount = items.filter((item) => item.status === 'LOW').length;
@@ -89,59 +123,103 @@ export default function InventoryDashboard() {
 
   const openEditModal = (item: InventoryItem) => {
     setEditingId(item.id);
-    setForm({ name: item.name, sku: item.sku, category: item.category, size: item.size, stock: String(item.stock), min: String(item.min), colors: item.colors });
+    setForm({
+      name: item.name,
+      sku: item.sku,
+      category: item.category,
+      size: item.size,
+      stock: String(item.stock),
+      min: String(item.min),
+      colors: item.colors || [],
+    });
     setIsModalOpen(true);
   };
 
-  const submitItem = () => {
+  // 2. Insert or Update inside Supabase
+  const submitItem = async () => {
+    const calculatedStatus = Number(form.stock) <= Number(form.min) ? 'LOW' : 'OK';
+
     const payload = {
-      ...form,
+      name: form.name,
+      sku: form.sku,
+      category: form.category,
+      size: form.size,
+      quantity: Number(form.stock),
       stock: Number(form.stock),
       min: Number(form.min),
-      status: Number(form.stock) <= Number(form.min) ? 'LOW' as const : 'OK' as const,
+      status: calculatedStatus,
+      colors: form.colors,
     };
 
     if (editingId) {
-      setItems((current) => current.map((item) => item.id === editingId ? { ...item, ...payload, id: item.id } : item));
-      setAuditLog((current) => [{ id: crypto.randomUUID(), action: 'UPDATE', item: payload.name, detail: 'Item updated', time: 'Just now' }, ...current]);
+      const { error } = await supabase.from('inventory').update(payload).eq('id', editingId);
+      if (error) console.error('Error updating item:', error);
+
+      setAuditLog((current) => [{ id: crypto.randomUUID(), action: 'UPDATE', item: form.name, detail: 'Item updated in database', time: 'Just now' }, ...current]);
     } else {
-      const newItem: InventoryItem = {
-        id: crypto.randomUUID(),
-        name: payload.name,
-        sku: payload.sku,
-        category: payload.category,
-        size: payload.size,
-        stock: payload.stock,
-        min: payload.min,
-        status: payload.status,
-        colors: payload.colors,
-      };
-      setItems((current) => [newItem, ...current]);
-      setAuditLog((current) => [{ id: crypto.randomUUID(), action: 'CREATE', item: payload.name, detail: 'New item added', time: 'Just now' }, ...current]);
+      const { error } = await supabase.from('inventory').insert([payload]);
+      if (error) console.error('Error creating item:', error);
+
+      setAuditLog((current) => [{ id: crypto.randomUUID(), action: 'CREATE', item: form.name, detail: 'New item added to database', time: 'Just now' }, ...current]);
+    }
+
+    // Refresh UI list
+    const { data } = await supabase.from('inventory').select('*').order('created_at', { ascending: false });
+    if (data) {
+      setItems(data.map((row) => ({
+        id: String(row.id),
+        name: row.name || '',
+        sku: row.sku || '',
+        category: row.category || '',
+        size: row.size || 'M',
+        stock: Number(row.stock ?? row.quantity ?? 0),
+        min: Number(row.min ?? 5),
+        status: row.status || (Number(row.stock ?? 0) <= Number(row.min ?? 5) ? 'LOW' : 'OK'),
+        colors: Array.isArray(row.colors) ? row.colors : [],
+      })));
     }
 
     setIsModalOpen(false);
   };
 
-  const adjustStock = (itemId: string, delta: number) => {
-    setItems((current) => current.map((item) => {
-      if (item.id !== itemId) return item;
-      const nextStock = item.stock + delta;
-      const nextStatus = nextStock <= item.min ? 'LOW' : 'OK';
-      return { ...item, stock: nextStock, status: nextStatus };
-    }));
-
+  // 3. Adjust Stock directly in Supabase
+  const adjustStock = async (itemId: string, delta: number) => {
     const item = items.find((entry) => entry.id === itemId);
-    if (item) {
-      setAuditLog((current) => [{ id: crypto.randomUUID(), action: 'STOCK_ADJUST', item: item.name, detail: `${delta > 0 ? '+' : ''}${delta} to ${item.stock + delta}`, time: 'Just now' }, ...current]);
+    if (!item) return;
+
+    const nextStock = item.stock + delta;
+    const nextStatus = nextStock <= item.min ? 'LOW' : 'OK';
+
+    const { error } = await supabase
+      .from('inventory')
+      .update({ stock: nextStock, quantity: nextStock, status: nextStatus })
+      .eq('id', itemId);
+
+    if (error) {
+      console.error('Error adjusting stock:', error);
+      return;
     }
+
+    setItems((current) =>
+      current.map((i) => (i.id === itemId ? { ...i, stock: nextStock, status: nextStatus } : i))
+    );
+
+    setAuditLog((current) => [{ id: crypto.randomUUID(), action: 'STOCK_ADJUST', item: item.name, detail: `${delta > 0 ? '+' : ''}${delta} to ${nextStock}`, time: 'Just now' }, ...current]);
   };
 
-  const deleteItem = (itemId: string) => {
+  // 4. Delete item from Supabase
+  const deleteItem = async (itemId: string) => {
     const item = items.find((entry) => entry.id === itemId);
+    const { error } = await supabase.from('inventory').delete().eq('id', itemId);
+
+    if (error) {
+      console.error('Error deleting item:', error);
+      return;
+    }
+
     setItems((current) => current.filter((entry) => entry.id !== itemId));
     if (item) {
-      setAuditLog((current) => [{ id: crypto.randomUUID(), action: 'DELETE', item: item.name, detail: 'Item removed', time: 'Just now' }, ...current]);
+      setAuditLog((current) => [{ id: crypto.randomUUID(), action: 'DELETE', item: item.name, detail: 'Item removed from database', time: 'Just now' }, ...current]);
     }
   };
 
@@ -262,7 +340,7 @@ export default function InventoryDashboard() {
             <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
               <div>
                 <h2 className="text-2xl font-black">Inventory overview</h2>
-                <p className="text-sm text-zinc-400">Responsive table with streamlined controls</p>
+                <p className="text-sm text-zinc-400">Responsive table with database sync</p>
               </div>
               <div className="flex flex-col gap-3 md:flex-row">
                 <label className="flex items-center gap-2 rounded-2xl border border-zinc-800 bg-black/40 px-3 py-2">
@@ -331,7 +409,7 @@ export default function InventoryDashboard() {
                         </div>
                       </div>
                       <div className="mt-3 flex flex-wrap gap-2">
-                        {item.colors.map((color) => (
+                        {(item.colors || []).map((color) => (
                           <span key={color} className="flex items-center gap-2 rounded-full border border-zinc-700 px-2.5 py-1 text-xs text-zinc-300">
                             <Circle size={10} fill="currentColor" /> {color}
                           </span>
