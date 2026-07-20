@@ -1,6 +1,6 @@
 'use client';
 
-import { supabase } from '@/library/supabaseClient';
+import { supabase } from './supabase';
 import { useEffect, useMemo, useState } from 'react';
 import { BarChart3, Box, Circle, Download, Edit3, Package2, Plus, Search, Trash2, TrendingUp, Warehouse } from 'lucide-react';
 import { ResponsiveContainer, BarChart, Bar, XAxis, YAxis, Tooltip, CartesianGrid } from 'recharts';
@@ -133,7 +133,7 @@ export default function InventoryDashboard() {
     setIsModalOpen(true);
   };
 
-  // 2. Insert or Update inside Supabase (Fixed payload columns!)
+  // 2. Insert or Update inside Supabase
   const submitItem = async () => {
     const stockVal = Number(form.stock);
     const minVal = Number(form.min);
