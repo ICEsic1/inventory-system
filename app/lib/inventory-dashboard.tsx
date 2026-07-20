@@ -134,6 +134,7 @@ export default function InventoryDashboard() {
   };
 
   // 2. Insert or Update inside Supabase
+// 2. Insert or Update inside Supabase
   const submitItem = async () => {
     const stockVal = Number(form.stock);
     const minVal = Number(form.min);
@@ -153,14 +154,18 @@ export default function InventoryDashboard() {
     if (editingId) {
       const { error } = await supabase.from('inventory').update(payload).eq('id', editingId);
       if (error) {
-        console.error('Error updating item:', error);
+        console.error('FULL SUPABASE UPDATE ERROR:', JSON.stringify(error, null, 2));
+        alert('Error updating: ' + error.message);
+        return;
       } else {
         setAuditLog((current) => [{ id: crypto.randomUUID(), action: 'UPDATE', item: form.name, detail: 'Item updated in database', time: 'Just now' }, ...current]);
       }
     } else {
       const { error } = await supabase.from('inventory').insert([payload]);
       if (error) {
-        console.error('Error creating item:', error);
+        console.error('FULL SUPABASE INSERT ERROR:', JSON.stringify(error, null, 2));
+        alert('Error creating: ' + error.message);
+        return;
       } else {
         setAuditLog((current) => [{ id: crypto.randomUUID(), action: 'CREATE', item: form.name, detail: 'New item added to database', time: 'Just now' }, ...current]);
       }
