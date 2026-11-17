@@ -13,7 +13,7 @@ export async function createItem(formData: FormData) {
   const colors = formData.get('colors')?.toString().split(',').filter(Boolean) || [];
   const status = stock <= min ? 'LOW' : 'OK';
 
-  const { error } = await supabase.from('inventory').insert({
+  const { error } = await supabase.from('items').insert({
     name,
     sku,
     category,
@@ -29,7 +29,7 @@ export async function createItem(formData: FormData) {
 }
 
 export async function adjustStock(itemId: string, delta: number) {
-  const { data, error } = await supabase.from('inventory').select('stock, min').eq('id', itemId).single();
+  const { data, error } = await supabase.from('items').select('stock, min').eq('id', itemId).single();
 
   if (error || !data) throw error || new Error('Item not found');
 
@@ -37,7 +37,7 @@ export async function adjustStock(itemId: string, delta: number) {
   const status = nextStock <= data.min ? 'LOW' : 'OK';
 
   const { error: updateError } = await supabase
-    .from('inventory')
+    .from('items')
     .update({ stock: nextStock, status })
     .eq('id', itemId);
 
@@ -47,7 +47,7 @@ export async function adjustStock(itemId: string, delta: number) {
 }
 
 export async function exportInventory(format: 'csv' | 'xlsx') {
-  const { data, error } = await supabase.from('inventory').select('name, sku, stock, min, size, colors, category, status');
+  const { data, error } = await supabase.from('items').select('name, sku, stock, min, size, colors, category, status');
   if (error) throw error;
 
   if (format === 'csv') {
