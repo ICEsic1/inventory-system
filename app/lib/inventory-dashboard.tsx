@@ -6,6 +6,7 @@ import { useEffect, useMemo, useState } from 'react';
 import {
   BarChart3,
   Box,
+  Check,
   Download,
   Edit3,
   Lock,
@@ -13,6 +14,7 @@ import {
   Mail,
   Moon,
   Package2,
+  Palette,
   Plus,
   Search,
   Sun,
@@ -81,6 +83,8 @@ const NAMED_COLORS: { name: string; hex: string }[] = [
   { name: 'Pink', hex: '#EC4899' },
 ];
 
+const FEATURED_SWATCHES = ['Black', 'White', 'Red', 'Orange', 'Yellow', 'Lime', 'Green', 'Cyan', 'Blue', 'Purple', 'Pink', 'Navy'];
+
 const COLOR_NAME_TO_HEX: Record<string, string> = NAMED_COLORS.reduce(
   (acc, entry) => {
     acc[entry.name.toLowerCase()] = entry.hex;
@@ -89,38 +93,68 @@ const COLOR_NAME_TO_HEX: Record<string, string> = NAMED_COLORS.reduce(
   {} as Record<string, string>
 );
 
-function getColorSwatchHex(color: string): string {
+function getColorFill(color: string): string {
   if (color.startsWith('#')) return color;
   return COLOR_NAME_TO_HEX[color.trim().toLowerCase()] || '#A1A1AA';
 }
 
-function ColorCircle({ color }: { color: string }) {
-  return (
-    <span
-      className="inline-block h-4 w-4 min-w-4 rounded-full border border-zinc-400/60 shrink-0"
-      style={{ backgroundColor: getColorSwatchHex(color), minWidth: '16px', minHeight: '16px' }}
-      aria-hidden="true"
-    />
-  );
+function hexToRgb(hex: string): { r: number; g: number; b: number } | null {
+  const clean = hex.replace('#', '').trim();
+  if (!/^[0-9a-fA-F]{6}$/.test(clean)) return null;
+  return {
+    r: parseInt(clean.slice(0, 2), 16),
+    g: parseInt(clean.slice(2, 4), 16),
+    b: parseInt(clean.slice(4, 6), 16),
+  };
+}
+
+function rgbToHex(r: number, g: number, b: number): string {
+  const clamp = (n: number) => Math.max(0, Math.min(255, Math.round(n)));
+  const toHex = (n: number) => clamp(n).toString(16).padStart(2, '0');
+  return `#${toHex(r)}${toHex(g)}${toHex(b)}`.toUpperCase();
+}
+
+function rgbToHsv(r: number, g: number, b: number): { h: number; s: number; v: number } {
+  const rn = r / 255;
+  const gn = g / 255;
+  const bn = b / 255;
+
+  const max = Math.max(rn, gn, bn);
+  const min = Math.min(rn, gn, bn);
+  const d = max - min;
+
+  let h = 0;
+  if (d !== 0) {
+    if (max === rn) {
+      h = 60 * (((gn - bn) / d) % 6);
+    } else if (max === gn) {
+      h = 60 * ((bn - rn) / d + 2);
+    } else {
+      h = 60 * ((rn - gn) / d + 4);
+    }
+  }
+  if (h < 0) h += 360;
+
+  const s = max === 0 ? 0 : d / max;
+  const v = max;
+
+  return { h, s, v };
 }
 
 function hexToColorName(hex: string): string {
-  const clean = hex.replace('#', '');
-  if (clean.length !== 6) return 'Custom';
-  const r = parseInt(clean.slice(0, 2), 16);
-  const g = parseInt(clean.slice(2, 4), 16);
-  const b = parseInt(clean.slice(4, 6), 16);
-  if ([r, g, b].some((n) => Number.isNaN(n))) return 'Custom';
+  const rgb = hexToRgb(hex);
+  if (!rgb) return 'Custom';
 
   let bestName = 'Custom';
   let bestDist = Infinity;
 
   for (const entry of NAMED_COLORS) {
-    const c = entry.hex.replace('#', '');
-    const cr = parseInt(c.slice(0, 2), 16);
-    const cg = parseInt(c.slice(2, 4), 16);
-    const cb = parseInt(c.slice(4, 6), 16);
-    const dist = (r - cr) ** 2 + (g - cg) ** 2 + (b - cb) ** 2;
+    const target = hexToRgb(entry.hex);
+    if (!target) continue;
+    const dist =
+      (rgb.r - target.r) ** 2 +
+      (rgb.g - target.g) ** 2 +
+      (rgb.b - target.b) ** 2;
     if (dist < bestDist) {
       bestDist = dist;
       bestName = entry.name;
@@ -128,6 +162,57 @@ function hexToColorName(hex: string): string {
   }
 
   return bestName;
+}
+
+function hsvToHex(h: number, s: number, v: number): string {
+  const hue = ((h % 360) + 360) % 360;
+  const sat = Math.max(0, Math.min(1, s));
+  const val = Math.max(0, Math.min(1, v));
+
+  const c = val * sat;
+  const x = c * (1 - Math.abs(((hue / 60) % 2) - 1));
+  const m = val - c;
+
+  let r1 = 0;
+  let g1 = 0;
+  let b1 = 0;
+
+  if (hue < 60) {
+    r1 = c;
+    g1 = x;
+  } else if (hue < 120) {
+    r1 = x;
+    g1 = c;
+  } else if (hue < 180) {
+    g1 = c;
+    b1 = x;
+  } else if (hue < 240) {
+    g1 = x;
+    b1 = c;
+  } else if (hue < 300) {
+    r1 = x;
+    b1 = c;
+  } else {
+    r1 = c;
+    b1 = x;
+  }
+
+  return rgbToHex((r1 + m) * 255, (g1 + m) * 255, (b1 + m) * 255);
+}
+
+function ColorCircle({ color, size = 'sm' }: { color: string; size?: 'sm' | 'md' | 'lg' }) {
+  const fill = getColorFill(color);
+  const sizeClass =
+    size === 'lg' ? 'h-6 w-6' : size === 'md' ? 'h-5 w-5' : 'h-4 w-4';
+  const minPx = size === 'lg' ? '24px' : size === 'md' ? '20px' : '16px';
+
+  return (
+    <span
+      className={`inline-block rounded-full border border-zinc-400/60 shrink-0 transition-transform duration-200 group-hover:scale-110 ${sizeClass}`}
+      style={{ backgroundColor: fill, minWidth: minPx, minHeight: minPx }}
+      aria-hidden="true"
+    />
+  );
 }
 
 export default function InventoryDashboard() {
@@ -152,7 +237,13 @@ export default function InventoryDashboard() {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [form, setForm] = useState({ name: '', sku: '', category: 'Shirts', size: 'M', stock: '0', min: '5', colors: [] as string[] });
   const [newCategory, setNewCategory] = useState('');
-  const [pendingColor, setPendingColor] = useState('#84cc16');
+
+  const [isPickerOpen, setIsPickerOpen] = useState(false);
+  const [hue, setHue] = useState(217);
+  const [sat, setSat] = useState(0.8);
+  const [val, setVal] = useState(0.96);
+  const [pickerHex, setPickerHex] = useState('#3B82F6');
+
   const [darkMode, setDarkMode] = useState(true);
 
   const actorName = useMemo(() => {
@@ -193,17 +284,23 @@ export default function InventoryDashboard() {
     cardBg3: darkMode ? 'bg-black/40' : 'bg-zinc-100/60',
     cardBgHover: darkMode ? 'bg-zinc-900/70' : 'bg-zinc-100',
     inputBg: darkMode ? 'bg-black/40' : 'bg-zinc-100',
-    btnPrimary: darkMode ? 'bg-white text-black border-zinc-700 hover:bg-zinc-100' : 'bg-black text-white border-zinc-400 hover:bg-zinc-800',
-    btnSecondary: darkMode ? 'bg-zinc-900 text-white border-zinc-700 hover:bg-zinc-800' : 'bg-zinc-200 text-black border-zinc-300 hover:bg-zinc-300',
-    tabActive: darkMode ? 'bg-white text-black' : 'bg-black text-white',
-    tabInactive: darkMode ? 'bg-zinc-900 text-zinc-300' : 'bg-zinc-200 text-zinc-600',
+    btnPrimary: darkMode
+      ? 'bg-white text-black border-zinc-700 hover:bg-zinc-100 hover:-translate-y-0.5 hover:shadow-lg active:scale-95 active:translate-y-0'
+      : 'bg-black text-white border-zinc-400 hover:bg-zinc-800 hover:-translate-y-0.5 hover:shadow-lg active:scale-95 active:translate-y-0',
+    btnSecondary: darkMode
+      ? 'bg-zinc-900 text-white border-zinc-700 hover:bg-zinc-800 hover:-translate-y-0.5 hover:shadow-md active:scale-95 active:translate-y-0'
+      : 'bg-zinc-200 text-black border-zinc-300 hover:bg-zinc-300 hover:-translate-y-0.5 hover:shadow-md active:scale-95 active:translate-y-0',
+    tabActive: darkMode ? 'bg-white text-black shadow-sm' : 'bg-black text-white shadow-sm',
+    tabInactive: darkMode
+      ? 'bg-zinc-900 text-zinc-300 hover:bg-zinc-800 hover:text-white'
+      : 'bg-zinc-200 text-zinc-600 hover:bg-zinc-300 hover:text-black',
     lowBg: darkMode ? 'bg-red-600/20 text-red-400 border-red-900/50' : 'bg-red-100 text-red-700 border-red-300',
     okBg: darkMode ? 'bg-emerald-600/20 text-emerald-400' : 'bg-emerald-100 text-emerald-700',
     progressBg: darkMode ? 'bg-zinc-800' : 'bg-zinc-300',
     progressFill: darkMode ? 'bg-white' : 'bg-black',
     chartStroke: darkMode ? '#27272a' : '#d4d4d8',
     chartAxis: darkMode ? '#a1a1aa' : '#52525b',
-    overlay: darkMode ? 'bg-black/70' : 'bg-white/70',
+    overlay: darkMode ? 'bg-black/75 backdrop-blur-xs' : 'bg-white/75 backdrop-blur-xs',
     modalBg: darkMode ? 'bg-zinc-950 border-zinc-800' : 'bg-white border-zinc-300',
     badgeBg: darkMode ? 'border-zinc-700 text-zinc-300' : 'border-zinc-400 text-zinc-600',
     needsRestockBg: darkMode ? 'bg-red-950/40' : 'bg-red-50',
@@ -261,15 +358,43 @@ export default function InventoryDashboard() {
     }));
   };
 
-  const approvePendingColor = (hexValue?: string) => {
-    const targetHex = hexValue || pendingColor;
-    const colorName = hexToColorName(targetHex);
+  const ensureColorSelected = (colorName: string) => {
     setForm((current) => ({
       ...current,
       colors: current.colors.includes(colorName)
         ? current.colors
         : [...current.colors, colorName],
     }));
+  };
+
+  const handleQuickSwatchSelect = (colorName: string) => {
+    const hex = getColorFill(colorName);
+    setPickerHex(hex);
+    const rgb = hexToRgb(hex);
+    if (rgb) {
+      const hsv = rgbToHsv(rgb.r, rgb.g, rgb.b);
+      setHue(hsv.h);
+      setSat(hsv.s);
+      setVal(hsv.v);
+    }
+    ensureColorSelected(colorName);
+  };
+
+  const updateSvFromPointer = (clientX: number, clientY: number, rect: DOMRect) => {
+    const nextSat = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+    const nextVal = Math.max(0, Math.min(1, 1 - (clientY - rect.top) / rect.height));
+    const nextHex = hsvToHex(hue, nextSat, nextVal);
+    setSat(nextSat);
+    setVal(nextVal);
+    setPickerHex(nextHex);
+    ensureColorSelected(hexToColorName(nextHex));
+  };
+
+  const updateHueFromValue = (nextHue: number) => {
+    const nextHex = hsvToHex(nextHue, sat, val);
+    setHue(nextHue);
+    setPickerHex(nextHex);
+    ensureColorSelected(hexToColorName(nextHex));
   };
 
   const fetchData = async () => {
@@ -361,6 +486,7 @@ export default function InventoryDashboard() {
   const openCreateModal = () => {
     setEditingId(null);
     setForm({ name: '', sku: '', category: categories[0]?.name || 'Shirts', size: 'M', stock: '0', min: '5', colors: [] });
+    setIsPickerOpen(false);
     setIsModalOpen(true);
   };
 
@@ -375,6 +501,7 @@ export default function InventoryDashboard() {
       min: String(item.min),
       colors: item.colors || [],
     });
+    setIsPickerOpen(false);
     setIsModalOpen(true);
   };
 
@@ -411,6 +538,7 @@ export default function InventoryDashboard() {
     }
 
     await fetchData();
+    setIsPickerOpen(false);
     setIsModalOpen(false);
   };
 
@@ -518,7 +646,7 @@ export default function InventoryDashboard() {
   if (!user) {
     return (
       <main className={`flex min-h-screen items-center justify-center px-4 py-10 ${t.bg} ${t.text} overflow-x-hidden`}>
-        <div className={`w-full max-w-md rounded-3xl border ${t.border} ${t.cardBg2} p-6 sm:p-8 shadow-2xl`}>
+        <div className={`w-full max-w-md rounded-3xl border ${t.border} ${t.cardBg2} p-6 sm:p-8 shadow-2xl transition-all duration-300`}>
           <div className="flex items-start justify-between">
             <div>
               <p className={`text-[10px] uppercase tracking-[0.35em] ${t.textMuted}`}>INVENTORY SYSTEM</p>
@@ -527,16 +655,16 @@ export default function InventoryDashboard() {
             <button
               type="button"
               onClick={() => setDarkMode(!darkMode)}
-              className={`rounded-2xl border ${t.border} ${t.cardBg} p-2.5 transition hover:scale-105`}
+              className={`rounded-2xl border ${t.border} ${t.cardBg} p-2.5 transition-all duration-200 hover:scale-105 active:scale-95`}
             >
-              {darkMode ? <Sun size={18} className="text-yellow-300" /> : <Moon size={18} className="text-zinc-700" />}
+              {darkMode ? <Sun size={18} className="text-yellow-300 transition-transform duration-300 hover:rotate-45" /> : <Moon size={18} className="text-zinc-700 transition-transform duration-300 hover:-rotate-12" />}
             </button>
           </div>
 
           <button
             type="button"
             onClick={handleGoogleLogin}
-            className={`mt-6 flex w-full items-center justify-center gap-3 rounded-2xl border ${t.btnSecondary} px-4 py-3 text-sm font-semibold transition`}
+            className={`mt-6 flex w-full items-center justify-center gap-3 rounded-2xl border ${t.btnSecondary} px-4 py-3 text-sm font-semibold transition-all duration-200`}
           >
             Continue with Google
           </button>
@@ -553,7 +681,7 @@ export default function InventoryDashboard() {
           <form onSubmit={handleManualAuth} className="space-y-4">
             <div>
               <label className={`mb-1.5 block text-xs font-medium ${t.textMuted}`}>Email Address</label>
-              <div className={`flex items-center gap-2.5 rounded-2xl border ${t.border} ${t.inputBg} px-3.5 py-2.5`}>
+              <div className={`flex items-center gap-2.5 rounded-2xl border ${t.border} ${t.inputBg} px-3.5 py-2.5 transition-colors duration-200 focus-within:border-zinc-500`}>
                 <Mail size={16} className={iconClass} />
                 <input type="email" required value={authEmail} onChange={(e) => setAuthEmail(e.target.value)} placeholder="name@printingdepot.ph" className={`w-full bg-transparent text-sm outline-none ${t.text}`} />
               </div>
@@ -561,13 +689,13 @@ export default function InventoryDashboard() {
 
             <div>
               <label className={`mb-1.5 block text-xs font-medium ${t.textMuted}`}>Password</label>
-              <div className={`flex items-center gap-2.5 rounded-2xl border ${t.border} ${t.inputBg} px-3.5 py-2.5`}>
+              <div className={`flex items-center gap-2.5 rounded-2xl border ${t.border} ${t.inputBg} px-3.5 py-2.5 transition-colors duration-200 focus-within:border-zinc-500`}>
                 <Lock size={16} className={iconClass} />
                 <input type="password" required minLength={6} value={authPassword} onChange={(e) => setAuthPassword(e.target.value)} placeholder="••••••••" className={`w-full bg-transparent text-sm outline-none ${t.text}`} />
               </div>
             </div>
 
-            <button type="submit" disabled={authSubmitting} className={`w-full rounded-2xl border ${t.btnPrimary} px-4 py-3 text-sm font-semibold transition disabled:opacity-50`}>
+            <button type="submit" disabled={authSubmitting} className={`w-full rounded-2xl border ${t.btnPrimary} px-4 py-3 text-sm font-semibold transition-all duration-200 disabled:opacity-50`}>
               {authSubmitting ? 'Please wait...' : authMode === 'login' ? 'Log In' : 'Create Account'}
             </button>
           </form>
@@ -576,12 +704,12 @@ export default function InventoryDashboard() {
             {authMode === 'login' ? (
               <p className={t.textMuted}>
                 Don&apos;t have an account?{' '}
-                <button type="button" onClick={() => setAuthMode('signup')} className="font-semibold underline underline-offset-4">Create account</button>
+                <button type="button" onClick={() => setAuthMode('signup')} className="font-semibold underline underline-offset-4 transition-opacity hover:opacity-80 active:scale-95">Create account</button>
               </p>
             ) : (
               <p className={t.textMuted}>
                 Already have an account?{' '}
-                <button type="button" onClick={() => setAuthMode('login')} className="font-semibold underline underline-offset-4">Log in</button>
+                <button type="button" onClick={() => setAuthMode('login')} className="font-semibold underline underline-offset-4 transition-opacity hover:opacity-80 active:scale-95">Log in</button>
               </p>
             )}
           </div>
@@ -590,13 +718,14 @@ export default function InventoryDashboard() {
     );
   }
 
-  const pendingColorName = hexToColorName(pendingColor);
   const allSelectableColors = Array.from(new Set([...colorOptions, ...form.colors]));
+  const currentHueHex = hsvToHex(hue, 1, 1);
+  const currentMatchedName = hexToColorName(pickerHex);
 
   return (
     <main className={`min-h-screen ${t.bg} ${t.text} transition-colors duration-300 overflow-x-hidden`}>
       <div className="mx-auto flex max-w-7xl flex-col gap-6 px-3 sm:px-6 lg:px-8 py-4 sm:py-6">
-        <header className={`flex flex-col gap-4 rounded-3xl border ${t.border} ${t.cardBg} p-4 sm:p-5 shadow-2xl lg:flex-row lg:items-center lg:justify-between`}>
+        <header className={`flex flex-col gap-4 rounded-3xl border ${t.border} ${t.cardBg} p-4 sm:p-5 shadow-2xl transition-colors duration-300 lg:flex-row lg:items-center lg:justify-between`}>
           <div className="flex items-center justify-between lg:justify-start lg:gap-4">
             <div className="min-w-0 flex-1">
               <p className={`text-[10px] sm:text-xs uppercase tracking-[0.35em] ${t.textMuted}`}>INVENTORY MANAGEMENT SYSTEM</p>
@@ -604,30 +733,30 @@ export default function InventoryDashboard() {
               <p className={`mt-1 text-xs ${t.textMuted} truncate`}>Signed in as <span className="font-semibold">{actorName}</span></p>
             </div>
             <div className="flex items-center gap-2 lg:hidden shrink-0">
-              <button onClick={() => setDarkMode(!darkMode)} className={`rounded-2xl border ${t.border} ${t.cardBg2} p-2.5 transition hover:scale-105`}>
-                {darkMode ? <Sun size={18} className="text-yellow-300" /> : <Moon size={18} className="text-zinc-700" />}
+              <button onClick={() => setDarkMode(!darkMode)} className={`rounded-2xl border ${t.border} ${t.cardBg2} p-2.5 transition-all duration-200 hover:scale-105 active:scale-95`}>
+                {darkMode ? <Sun size={18} className="text-yellow-300 transition-transform duration-300 hover:rotate-45" /> : <Moon size={18} className="text-zinc-700 transition-transform duration-300 hover:-rotate-12" />}
               </button>
-              <button onClick={handleLogout} className={`rounded-2xl border ${t.border} ${t.cardBg2} p-2.5 text-red-400 transition hover:scale-105`}>
+              <button onClick={handleLogout} className={`rounded-2xl border ${t.border} ${t.cardBg2} p-2.5 text-red-400 transition-all duration-200 hover:scale-105 hover:border-red-500/50 active:scale-95`}>
                 <LogOut size={18} />
               </button>
             </div>
           </div>
 
           <div className="grid grid-cols-2 gap-2 sm:flex sm:flex-wrap sm:items-center sm:gap-3">
-            <button onClick={() => setDarkMode(!darkMode)} className={`hidden rounded-2xl border ${t.border} ${t.cardBg2} p-2.5 transition hover:scale-105 lg:block`}>
-              {darkMode ? <Sun size={18} className="text-yellow-300" /> : <Moon size={18} className="text-zinc-700" />}
+            <button onClick={() => setDarkMode(!darkMode)} className={`hidden rounded-2xl border ${t.border} ${t.cardBg2} p-2.5 transition-all duration-200 hover:scale-105 active:scale-95 lg:block`}>
+              {darkMode ? <Sun size={18} className="text-yellow-300 transition-transform duration-300 hover:rotate-45" /> : <Moon size={18} className="text-zinc-700 transition-transform duration-300 hover:-rotate-12" />}
             </button>
-            <button onClick={openCreateModal} className={`col-span-2 sm:col-span-1 rounded-2xl border ${t.btnPrimary} px-4 py-3 sm:py-2.5 text-sm font-semibold transition flex items-center justify-center gap-2`}>
-              <Plus size={16} /> New Item
+            <button onClick={openCreateModal} className={`group col-span-2 sm:col-span-1 rounded-2xl border ${t.btnPrimary} px-4 py-3 sm:py-2.5 text-sm font-semibold transition-all duration-200 flex items-center justify-center gap-2`}>
+              <Plus size={16} className="transition-transform duration-200 group-hover:rotate-90" /> New Item
             </button>
-            <button onClick={() => exportInventory('csv')} className={`rounded-2xl border ${t.btnSecondary} px-3 sm:px-4 py-3 sm:py-2.5 text-xs sm:text-sm font-semibold transition flex items-center justify-center gap-1.5 sm:gap-2`}>
-              <Download size={15} /> Export CSV
+            <button onClick={() => exportInventory('csv')} className={`group rounded-2xl border ${t.btnSecondary} px-3 sm:px-4 py-3 sm:py-2.5 text-xs sm:text-sm font-semibold transition-all duration-200 flex items-center justify-center gap-1.5 sm:gap-2`}>
+              <Download size={15} className="transition-transform duration-200 group-hover:translate-y-0.5" /> Export CSV
             </button>
-            <button onClick={() => exportInventory('xlsx')} className={`rounded-2xl border ${t.btnSecondary} px-3 sm:px-4 py-3 sm:py-2.5 text-xs sm:text-sm font-semibold transition flex items-center justify-center gap-1.5 sm:gap-2`}>
-              <BarChart3 size={15} /> Export XLSX
+            <button onClick={() => exportInventory('xlsx')} className={`group rounded-2xl border ${t.btnSecondary} px-3 sm:px-4 py-3 sm:py-2.5 text-xs sm:text-sm font-semibold transition-all duration-200 flex items-center justify-center gap-1.5 sm:gap-2`}>
+              <BarChart3 size={15} className="transition-transform duration-200 group-hover:scale-110" /> Export XLSX
             </button>
-            <button onClick={handleLogout} className={`hidden lg:flex rounded-2xl border ${t.btnSecondary} px-4 py-2.5 text-sm font-semibold text-red-400 transition items-center justify-center gap-2`}>
-              <LogOut size={15} /> Sign Out
+            <button onClick={handleLogout} className={`group hidden lg:flex rounded-2xl border ${t.btnSecondary} px-4 py-2.5 text-sm font-semibold text-red-400 transition-all duration-200 items-center justify-center gap-2`}>
+              <LogOut size={15} className="transition-transform duration-200 group-hover:translate-x-0.5" /> Sign Out
             </button>
           </div>
         </header>
@@ -639,10 +768,10 @@ export default function InventoryDashboard() {
             { label: 'Low Stock', value: lowStockCount, icon: Box },
             { label: 'Categories', value: categories.length, icon: Warehouse },
           ].map((card) => (
-            <div key={card.label} className={`rounded-3xl border ${t.border} ${t.cardBg2} p-4 sm:p-5`}>
+            <div key={card.label} className={`group rounded-3xl border ${t.border} ${t.cardBg2} p-4 sm:p-5 transition-all duration-200 hover:-translate-y-0.5 hover:shadow-xl`}>
               <div className="flex items-center justify-between">
                 <p className={`text-xs sm:text-sm ${t.textMuted}`}>{card.label}</p>
-                <card.icon className={`h-4 w-4 sm:h-5 sm:w-5 ${iconClass}`} />
+                <card.icon className={`h-4 w-4 sm:h-5 sm:w-5 ${iconClass} transition-transform duration-200 group-hover:scale-110`} />
               </div>
               <p className="mt-3 sm:mt-4 text-xl sm:text-3xl font-black truncate">{card.value}</p>
             </div>
@@ -650,7 +779,7 @@ export default function InventoryDashboard() {
         </section>
 
         <section className="grid gap-6 xl:grid-cols-[1.15fr_0.85fr]">
-          <div className={`rounded-3xl border ${t.border} ${t.cardBg2} p-4 sm:p-5 overflow-hidden`}>
+          <div className={`rounded-3xl border ${t.border} ${t.cardBg2} p-4 sm:p-5 overflow-hidden transition-all duration-200 hover:shadow-xl`}>
             <div className="mb-4 flex items-center justify-between">
               <div>
                 <h2 className="text-lg sm:text-xl font-bold">Stock by category</h2>
@@ -672,7 +801,7 @@ export default function InventoryDashboard() {
             </div>
           </div>
 
-          <div className={`rounded-3xl border ${t.border} ${t.cardBg2} p-4 sm:p-5`}>
+          <div className={`rounded-3xl border ${t.border} ${t.cardBg2} p-4 sm:p-5 transition-all duration-200 hover:shadow-xl`}>
             <div className="mb-4 flex items-center justify-between">
               <div>
                 <h2 className="text-lg sm:text-xl font-bold">Recent audit activity</h2>
@@ -685,7 +814,7 @@ export default function InventoryDashboard() {
                 <p className={`text-sm ${t.textMuted} py-6 text-center`}>No audit events recorded yet.</p>
               ) : (
                 auditLog.map((entry) => (
-                  <div key={entry.id} className={`flex items-center justify-between gap-3 rounded-2xl border ${t.border} ${t.cardBg3} p-3`}>
+                  <div key={entry.id} className={`flex items-center justify-between gap-3 rounded-2xl border ${t.border} ${t.cardBg3} p-3 transition-all duration-200 hover:translate-x-0.5`}>
                     <div className="min-w-0 flex-1">
                       <p className="font-semibold text-xs sm:text-sm truncate">{entry.item}</p>
                       <p className={`text-[11px] sm:text-xs ${t.textMuted} truncate`}>{entry.detail}</p>
@@ -710,16 +839,16 @@ export default function InventoryDashboard() {
                 <p className={`text-sm ${t.textMuted}`}>Responsive table with database sync</p>
               </div>
               <div className="flex flex-col gap-2.5 sm:flex-row">
-                <label className={`flex items-center gap-2 rounded-2xl border ${t.border} ${t.cardBg3} px-3 py-2`}>
+                <label className={`flex items-center gap-2 rounded-2xl border ${t.border} ${t.cardBg3} px-3 py-2 transition-colors duration-200 focus-within:border-zinc-500`}>
                   <Search size={16} className={iconClass} />
                   <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search item, SKU or color" className={`w-full bg-transparent text-sm outline-none sm:w-56 ${t.text}`} />
                 </label>
-                <select value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)} className={`rounded-2xl border ${t.border} ${t.inputBg} px-3 py-2 text-sm ${t.text}`}>
+                <select value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)} className={`cursor-pointer rounded-2xl border ${t.border} ${t.inputBg} px-3 py-2 text-sm ${t.text} transition-colors duration-200 hover:border-zinc-500`}>
                   <option value="ALL">All status</option>
                   <option value="LOW">Low</option>
                   <option value="OK">Ok</option>
                 </select>
-                <select value={categoryFilter} onChange={(event) => setCategoryFilter(event.target.value)} className={`rounded-2xl border ${t.border} ${t.inputBg} px-3 py-2 text-sm ${t.text}`}>
+                <select value={categoryFilter} onChange={(event) => setCategoryFilter(event.target.value)} className={`cursor-pointer rounded-2xl border ${t.border} ${t.inputBg} px-3 py-2 text-sm ${t.text} transition-colors duration-200 hover:border-zinc-500`}>
                   <option value="ALL">All categories</option>
                   {categories.map((category) => (
                     <option key={category.id} value={category.name}>{category.name}</option>
@@ -729,14 +858,14 @@ export default function InventoryDashboard() {
             </div>
 
             <div className={`mt-6 flex gap-2 border-b ${t.border} pb-3 text-sm`}>
-              <button onClick={() => setActiveTab('inventory')} className={`rounded-full px-4 py-1.5 transition font-medium ${activeTab === 'inventory' ? t.tabActive : t.tabInactive}`}>Inventory</button>
-              <button onClick={() => setActiveTab('audit')} className={`rounded-full px-4 py-1.5 transition font-medium ${activeTab === 'audit' ? t.tabActive : t.tabInactive}`}>Audit Log ({auditLog.length})</button>
+              <button onClick={() => setActiveTab('inventory')} className={`rounded-full px-4 py-1.5 font-medium transition-all duration-200 active:scale-95 ${activeTab === 'inventory' ? t.tabActive : t.tabInactive}`}>Inventory</button>
+              <button onClick={() => setActiveTab('audit')} className={`rounded-full px-4 py-1.5 font-medium transition-all duration-200 active:scale-95 ${activeTab === 'audit' ? t.tabActive : t.tabInactive}`}>Audit Log ({auditLog.length})</button>
             </div>
 
             {activeTab === 'inventory' ? (
               <div className="mt-5 space-y-3">
                 {filteredItems.map((item) => (
-                  <div key={item.id} className={`rounded-2xl border ${t.border} ${t.cardBgHover} p-3.5 sm:p-4 transition`}>
+                  <div key={item.id} className={`rounded-2xl border ${t.border} ${t.cardBgHover} p-3.5 sm:p-4 transition-all duration-200 hover:-translate-y-0.5 hover:shadow-lg`}>
                     <div className="flex items-start justify-between gap-2">
                       <div className="min-w-0 flex-1">
                         <p className="font-semibold text-sm sm:text-base truncate">{item.name}</p>
@@ -744,7 +873,7 @@ export default function InventoryDashboard() {
                       </div>
                       <div className="flex items-center gap-2 shrink-0">
                         <span className={`rounded-full border ${t.badgeBg} px-2 py-0.5 text-[11px]`}>{item.category}</span>
-                        <span className={`rounded-full px-2.5 py-0.5 text-[11px] font-semibold ${item.status === 'LOW' ? t.lowBg : t.okBg}`}>{item.status}</span>
+                        <span className={`rounded-full px-2.5 py-0.5 text-[11px] font-semibold transition-transform duration-200 hover:scale-105 ${item.status === 'LOW' ? t.lowBg : t.okBg}`}>{item.status}</span>
                       </div>
                     </div>
 
@@ -754,24 +883,24 @@ export default function InventoryDashboard() {
                           <span className={t.textMuted}>Stock: <strong className={t.text}>{item.stock}</strong></span>
                           <span className={t.textMuted}>Min: {item.min}</span>
                         </div>
-                        <div className={`h-2 w-full rounded-full ${t.progressBg}`}>
-                          <div className={`h-2 rounded-full ${t.progressFill}`} style={{ width: `${Math.min(100, (item.stock / Math.max(item.min, 1)) * 100)}%` }} />
+                        <div className={`h-2 w-full rounded-full overflow-hidden ${t.progressBg}`}>
+                          <div className={`h-2 rounded-full transition-all duration-500 ease-out ${t.progressFill}`} style={{ width: `${Math.min(100, (item.stock / Math.max(item.min, 1)) * 100)}%` }} />
                         </div>
                       </div>
 
-                      <div className="flex items-center gap-1 shrink-0 pt-3">
-                        <button onClick={() => adjustStock(item.id, -1)} className={`rounded-full border ${t.border} px-2.5 py-1 text-xs transition hover:bg-zinc-800`}>-</button>
-                        <button onClick={() => adjustStock(item.id, 1)} className={`rounded-full border ${t.border} px-2.5 py-1 text-xs transition hover:bg-zinc-800`}>+</button>
-                        <button onClick={() => openEditModal(item)} className={`rounded-full border ${t.border} p-1.5 transition hover:bg-zinc-800`}><Edit3 size={13} /></button>
-                        <button onClick={() => deleteItem(item.id)} className={`rounded-full border ${t.border} p-1.5 transition text-red-400 hover:bg-zinc-800`}><Trash2 size={13} /></button>
+                      <div className="flex items-center gap-1.5 shrink-0 pt-3">
+                        <button onClick={() => adjustStock(item.id, -1)} className={`rounded-full border ${t.border} px-2.5 py-1 text-xs font-semibold transition-all duration-150 hover:scale-110 hover:bg-zinc-800 hover:text-white active:scale-90`}>-</button>
+                        <button onClick={() => adjustStock(item.id, 1)} className={`rounded-full border ${t.border} px-2.5 py-1 text-xs font-semibold transition-all duration-150 hover:scale-110 hover:bg-zinc-800 hover:text-white active:scale-90`}>+</button>
+                        <button onClick={() => openEditModal(item)} className={`rounded-full border ${t.border} p-1.5 transition-all duration-150 hover:scale-110 hover:bg-zinc-800 hover:text-white active:scale-90`}><Edit3 size={13} /></button>
+                        <button onClick={() => deleteItem(item.id)} className={`rounded-full border ${t.border} p-1.5 text-red-400 transition-all duration-150 hover:scale-110 hover:bg-red-950/60 active:scale-90`}><Trash2 size={13} /></button>
                       </div>
                     </div>
 
                     {(item.colors || []).length > 0 && (
                       <div className="mt-3 flex flex-wrap gap-1.5 pt-2 border-t border-zinc-800/40">
                         {(item.colors || []).map((color) => (
-                          <span key={color} className={`flex items-center gap-2 rounded-full border ${t.badgeBg} px-2.5 py-0.5 text-[11px]`}>
-                            <ColorCircle color={color} />
+                          <span key={color} className={`group flex items-center gap-2 rounded-full border ${t.badgeBg} px-2.5 py-0.5 text-[11px] transition-transform duration-150 hover:scale-105`}>
+                            <ColorCircle color={color} size="sm" />
                             <span>{color}</span>
                           </span>
                         ))}
@@ -783,7 +912,7 @@ export default function InventoryDashboard() {
             ) : (
               <div className={`mt-5 space-y-3 rounded-2xl border ${t.border} ${t.cardBg3} p-4 max-h-[500px] overflow-y-auto`}>
                 {auditLog.map((entry) => (
-                  <div key={entry.id} className={`flex items-center justify-between gap-3 rounded-2xl border ${t.border} ${t.cardBgHover} p-3`}>
+                  <div key={entry.id} className={`flex items-center justify-between gap-3 rounded-2xl border ${t.border} ${t.cardBgHover} p-3 transition-all duration-200 hover:translate-x-0.5`}>
                     <div className="min-w-0 flex-1">
                       <p className="font-semibold text-sm truncate">{entry.item}</p>
                       <p className={`text-xs ${t.textMuted} truncate`}>{entry.detail}</p>
@@ -804,14 +933,14 @@ export default function InventoryDashboard() {
               <h3 className="text-lg font-bold">Category manager</h3>
               <p className={`mt-1 text-sm ${t.textMuted}`}>Keep the assortment neatly organized.</p>
               <div className="mt-4 flex gap-2">
-                <input value={newCategory} onChange={(event) => setNewCategory(event.target.value)} placeholder="New category" className={`flex-1 rounded-2xl border ${t.border} ${t.inputBg} px-3 py-2 text-sm outline-none ${t.text}`} />
-                <button onClick={addCategory} className={`rounded-2xl border ${t.btnPrimary} px-3 py-2 text-sm font-semibold transition`}>Add</button>
+                <input value={newCategory} onChange={(event) => setNewCategory(event.target.value)} placeholder="New category" className={`flex-1 rounded-2xl border ${t.border} ${t.inputBg} px-3 py-2 text-sm outline-none transition-colors duration-200 focus:border-zinc-500 ${t.text}`} />
+                <button onClick={addCategory} className={`rounded-2xl border ${t.btnPrimary} px-3 py-2 text-sm font-semibold transition-all duration-200`}>Add</button>
               </div>
               <div className="mt-4 flex flex-wrap gap-2">
                 {categories.map((category) => (
-                  <span key={category.id} className={`inline-flex items-center gap-1.5 rounded-full border ${t.badgeBg} py-1 pr-2 pl-3 text-sm`}>
+                  <span key={category.id} className={`inline-flex items-center gap-1.5 rounded-full border ${t.badgeBg} py-1 pr-2 pl-3 text-sm transition-transform duration-150 hover:scale-105`}>
                     <span>{category.name}</span>
-                    <button type="button" onClick={() => deleteCategory(category.id, category.name)} title={`Remove ${category.name}`} className="rounded-full p-0.5 transition hover:text-red-400">
+                    <button type="button" onClick={() => deleteCategory(category.id, category.name)} title={`Remove ${category.name}`} className="rounded-full p-0.5 transition-all duration-150 hover:scale-125 hover:text-red-400 active:scale-90">
                       <X size={13} />
                     </button>
                   </span>
@@ -823,7 +952,7 @@ export default function InventoryDashboard() {
               <h3 className="text-lg font-bold">Needs restocking</h3>
               <div className="mt-4 space-y-2">
                 {items.filter((item) => item.status === 'LOW').map((item) => (
-                  <div key={item.id} className={`rounded-2xl border ${t.needsRestockBorder} ${t.needsRestockBg} p-3 text-sm`}>
+                  <div key={item.id} className={`rounded-2xl border ${t.needsRestockBorder} ${t.needsRestockBg} p-3 text-sm transition-all duration-200 hover:-translate-y-0.5`}>
                     <p className="font-semibold">{item.name}</p>
                     <p className={`${t.textMuted}`}>{item.sku} &bull; {item.stock} in stock</p>
                   </div>
@@ -835,28 +964,28 @@ export default function InventoryDashboard() {
       </div>
 
       {isModalOpen && (
-        <div className={`fixed inset-0 z-50 flex items-center justify-center ${t.overlay} p-3 sm:p-4 overflow-y-auto`}>
-          <div className={`my-auto max-h-[90vh] w-full max-w-xl overflow-y-auto rounded-3xl border ${t.modalBg} p-4 sm:p-6 shadow-2xl`}>
+        <div className={`fixed inset-0 z-50 flex items-center justify-center ${t.overlay} p-3 sm:p-4 overflow-y-auto transition-opacity duration-200`}>
+          <div className={`my-auto max-h-[90vh] w-full max-w-xl overflow-y-auto rounded-3xl border ${t.modalBg} p-4 sm:p-6 shadow-2xl transition-all duration-200`}>
             <div className="flex items-center justify-between">
               <div>
                 <p className={`text-xs uppercase tracking-[0.3em] ${t.textMuted}`}>{editingId ? 'Edit item' : 'New item'}</p>
                 <h3 className="text-xl sm:text-2xl font-black">Item details</h3>
               </div>
-              <button onClick={() => setIsModalOpen(false)} className={`rounded-full border ${t.border} px-3 py-1 text-xs`}>Close</button>
+              <button onClick={() => setIsModalOpen(false)} className={`rounded-full border ${t.border} px-3 py-1 text-xs transition-all duration-150 hover:scale-105 active:scale-95`}>Close</button>
             </div>
 
             <div className="mt-5 grid gap-3 sm:gap-4 sm:grid-cols-2">
               <label className="text-sm">
                 <span className={`mb-1.5 block ${t.textMuted}`}>Item Name</span>
-                <input value={form.name} onChange={(event) => setForm((current) => ({ ...current, name: event.target.value }))} className={`w-full rounded-2xl border ${t.border} ${t.inputBg} px-3 py-2 outline-none ${t.text}`} />
+                <input value={form.name} onChange={(event) => setForm((current) => ({ ...current, name: event.target.value }))} className={`w-full rounded-2xl border ${t.border} ${t.inputBg} px-3 py-2 outline-none transition-colors duration-200 focus:border-zinc-500 ${t.text}`} />
               </label>
               <label className="text-sm">
                 <span className={`mb-1.5 block ${t.textMuted}`}>SKU</span>
-                <input value={form.sku} onChange={(event) => setForm((current) => ({ ...current, sku: event.target.value }))} className={`w-full rounded-2xl border ${t.border} ${t.inputBg} px-3 py-2 outline-none ${t.text}`} />
+                <input value={form.sku} onChange={(event) => setForm((current) => ({ ...current, sku: event.target.value }))} className={`w-full rounded-2xl border ${t.border} ${t.inputBg} px-3 py-2 outline-none transition-colors duration-200 focus:border-zinc-500 ${t.text}`} />
               </label>
               <label className="text-sm">
                 <span className={`mb-1.5 block ${t.textMuted}`}>Category</span>
-                <select value={form.category} onChange={(event) => setForm((current) => ({ ...current, category: event.target.value }))} className={`w-full rounded-2xl border ${t.border} ${t.inputBg} px-3 py-2 outline-none ${t.text}`}>
+                <select value={form.category} onChange={(event) => setForm((current) => ({ ...current, category: event.target.value }))} className={`w-full rounded-2xl border ${t.border} ${t.inputBg} px-3 py-2 outline-none transition-colors duration-200 focus:border-zinc-500 ${t.text}`}>
                   {categories.map((category) => (
                     <option key={category.id} value={category.name}>{category.name}</option>
                   ))}
@@ -864,15 +993,15 @@ export default function InventoryDashboard() {
               </label>
               <label className="text-sm">
                 <span className={`mb-1.5 block ${t.textMuted}`}>Size</span>
-                <input value={form.size} onChange={(event) => setForm((current) => ({ ...current, size: event.target.value }))} className={`w-full rounded-2xl border ${t.border} ${t.inputBg} px-3 py-2 outline-none ${t.text}`} />
+                <input value={form.size} onChange={(event) => setForm((current) => ({ ...current, size: event.target.value }))} className={`w-full rounded-2xl border ${t.border} ${t.inputBg} px-3 py-2 outline-none transition-colors duration-200 focus:border-zinc-500 ${t.text}`} />
               </label>
               <label className="text-sm">
                 <span className={`mb-1.5 block ${t.textMuted}`}>Current Stock</span>
-                <input type="number" value={form.stock} onChange={(event) => setForm((current) => ({ ...current, stock: event.target.value }))} className={`w-full rounded-2xl border ${t.border} ${t.inputBg} px-3 py-2 outline-none ${t.text}`} />
+                <input type="number" value={form.stock} onChange={(event) => setForm((current) => ({ ...current, stock: event.target.value }))} className={`w-full rounded-2xl border ${t.border} ${t.inputBg} px-3 py-2 outline-none transition-colors duration-200 focus:border-zinc-500 ${t.text}`} />
               </label>
               <label className="text-sm">
                 <span className={`mb-1.5 block ${t.textMuted}`}>Low Stock Threshold</span>
-                <input type="number" value={form.min} onChange={(event) => setForm((current) => ({ ...current, min: event.target.value }))} className={`w-full rounded-2xl border ${t.border} ${t.inputBg} px-3 py-2 outline-none ${t.text}`} />
+                <input type="number" value={form.min} onChange={(event) => setForm((current) => ({ ...current, min: event.target.value }))} className={`w-full rounded-2xl border ${t.border} ${t.inputBg} px-3 py-2 outline-none transition-colors duration-200 focus:border-zinc-500 ${t.text}`} />
               </label>
             </div>
 
@@ -886,43 +1015,143 @@ export default function InventoryDashboard() {
                       key={color}
                       type="button"
                       onClick={() => toggleColor(color)}
-                      className={`flex items-center gap-2 rounded-full border px-3 sm:px-4 py-1.5 text-xs sm:text-sm transition ${
+                      className={`group flex items-center gap-2 rounded-full border px-3 sm:px-4 py-1.5 text-xs sm:text-sm transition-all duration-150 hover:scale-105 active:scale-95 ${
                         isSelected
-                          ? `${t.tabActive} ${t.border} font-medium`
+                          ? `${t.tabActive} ${t.border} font-medium shadow-sm`
                           : `${t.border} bg-transparent ${t.text} ${t.cardBgHover}`
                       }`}
                     >
-                      <ColorCircle color={color} />
+                      <ColorCircle color={color} size="sm" />
                       <span>{color}</span>
                     </button>
                   );
                 })}
               </div>
 
-              <div className="mt-3 flex flex-wrap items-center gap-2">
-                <label className={`flex cursor-pointer items-center gap-2 rounded-2xl border ${t.border} ${t.inputBg} px-3 py-1.5 text-xs sm:text-sm ${t.text}`}>
-                  <input
-                    type="color"
-                    value={pendingColor}
-                    onChange={(e) => setPendingColor(e.target.value)}
-                    onBlur={(e) => approvePendingColor(e.target.value)}
-                    className="h-6 w-6 cursor-pointer rounded border-0 bg-transparent p-0"
-                  />
-                  <span>{pendingColorName}</span>
-                </label>
+              <div className="mt-3">
                 <button
                   type="button"
-                  onClick={() => approvePendingColor()}
-                  className={`rounded-2xl border ${t.btnSecondary} px-3.5 py-1.5 text-xs sm:text-sm font-semibold transition`}
+                  onClick={() => setIsPickerOpen((open) => !open)}
+                  className={`group inline-flex items-center gap-2 rounded-2xl border ${t.border} ${isPickerOpen ? t.cardBgHover : t.inputBg} px-3.5 py-2 text-xs sm:text-sm font-medium ${t.text} transition-all duration-150 hover:scale-105 active:scale-95`}
                 >
-                  OK
+                  <Palette size={15} className={`${iconClass} transition-transform duration-200 group-hover:rotate-12`} />
+                  <span>Custom Color</span>
                 </button>
+
+                {isPickerOpen && (
+                  <div className={`mt-2.5 w-full max-w-xs rounded-3xl border ${t.border} ${t.cardBg} p-4 shadow-2xl transition-all duration-200`}>
+                    <div className={`flex items-center justify-between gap-2 pb-3 border-b ${t.border}`}>
+                      <div className="flex items-center gap-2.5 min-w-0">
+                        <ColorCircle color={pickerHex} size="lg" />
+                        <div className="min-w-0">
+                          <p className="text-sm font-bold truncate">{currentMatchedName}</p>
+                          <p className={`text-[11px] font-mono ${t.textMuted}`}>{pickerHex}</p>
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-1 shrink-0">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            ensureColorSelected(currentMatchedName);
+                            setIsPickerOpen(false);
+                          }}
+                          title={`Add ${currentMatchedName}`}
+                          className={`rounded-xl border ${t.btnPrimary} p-1.5 transition-all duration-150 hover:scale-110 active:scale-90`}
+                        >
+                          <Check size={14} />
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setIsPickerOpen(false)}
+                          title="Close picker"
+                          className={`rounded-xl border ${t.border} ${t.inputBg} p-1.5 ${t.textMuted} transition-all duration-150 hover:scale-110 active:scale-90`}
+                        >
+                          <X size={14} />
+                        </button>
+                      </div>
+                    </div>
+
+                    <div
+                      onPointerDown={(e) => {
+                        e.currentTarget.setPointerCapture(e.pointerId);
+                        updateSvFromPointer(e.clientX, e.clientY, e.currentTarget.getBoundingClientRect());
+                      }}
+                      onPointerMove={(e) => {
+                        if (e.buttons !== 1 && e.pressure === 0) return;
+                        updateSvFromPointer(e.clientX, e.clientY, e.currentTarget.getBoundingClientRect());
+                      }}
+                      className={`mt-3.5 relative h-36 w-full cursor-crosshair rounded-2xl border ${t.border} select-none touch-none`}
+                      style={{
+                        backgroundColor: currentHueHex,
+                        backgroundImage:
+                          'linear-gradient(to top, #000000, transparent), linear-gradient(to right, #ffffff, transparent)',
+                      }}
+                    >
+                      <span
+                        className="pointer-events-none absolute h-4 w-4 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-white shadow-lg transition-transform duration-75"
+                        style={{
+                          left: `${sat * 100}%`,
+                          top: `${(1 - val) * 100}%`,
+                          backgroundColor: pickerHex,
+                        }}
+                      />
+                    </div>
+
+                    <div className="mt-3">
+                      <input
+                        type="range"
+                        min={0}
+                        max={360}
+                        value={hue}
+                        onChange={(e) => updateHueFromValue(Number(e.target.value))}
+                        aria-label="Hue"
+                        className={`h-3 w-full cursor-pointer appearance-none rounded-full border ${t.border} transition-opacity hover:opacity-95`}
+                        style={{
+                          background:
+                            'linear-gradient(to right, #ff0000 0%, #ffff00 17%, #00ff00 33%, #00ffff 50%, #0000ff 67%, #ff00ff 83%, #ff0000 100%)',
+                        }}
+                      />
+                    </div>
+
+                    <div className="mt-3.5">
+                      <p className={`mb-2 text-[11px] font-medium ${t.textMuted}`}>Quick Color Swatches</p>
+                      <div className="grid grid-cols-6 gap-2">
+                        {FEATURED_SWATCHES.map((swatchName) => {
+                          const isSelected = form.colors.includes(swatchName);
+                          return (
+                            <button
+                              key={swatchName}
+                              type="button"
+                              onClick={() => handleQuickSwatchSelect(swatchName)}
+                              title={swatchName}
+                              className={`flex h-8 w-8 items-center justify-center rounded-full border transition-all duration-150 hover:scale-110 active:scale-90 ${
+                                isSelected ? 'ring-2 ring-emerald-400 border-white scale-105' : `${t.border}`
+                              }`}
+                              style={{ backgroundColor: getColorFill(swatchName) }}
+                            >
+                              {isSelected && (
+                                <Check
+                                  size={13}
+                                  className={
+                                    ['White', 'Cream', 'Yellow', 'Lime', 'Cyan', 'Sky Blue', 'Silver'].includes(swatchName)
+                                      ? 'text-black'
+                                      : 'text-white'
+                                  }
+                                />
+                              )}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  </div>
+                )}
               </div>
             </div>
 
             <div className="mt-6 flex justify-end gap-3">
-              <button onClick={() => setIsModalOpen(false)} className={`rounded-2xl border ${t.btnSecondary} px-4 py-2 text-sm transition`}>Cancel</button>
-              <button onClick={submitItem} className={`rounded-2xl border ${t.btnPrimary} px-4 py-2 text-sm font-semibold transition`}>Save</button>
+              <button onClick={() => setIsModalOpen(false)} className={`rounded-2xl border ${t.btnSecondary} px-4 py-2 text-sm transition-all duration-200`}>Cancel</button>
+              <button onClick={submitItem} className={`rounded-2xl border ${t.btnPrimary} px-4 py-2 text-sm font-semibold transition-all duration-200`}>Save</button>
             </div>
           </div>
         </div>
