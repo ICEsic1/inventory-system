@@ -278,6 +278,7 @@ export default function InventoryDashboard() {
   const [scanFeedback, setScanFeedback] = useState<string | null>(null);
   const scannerInstanceRef = useRef<any>(null);
   const scannerRunningRef = useRef(false);
+  const scanLockedRef = useRef(false);
   const itemsRef = useRef<InventoryItem[]>([]);
   const scanModeRef = useRef<ScanActionMode>('search');
   const scanQuantityRef = useRef<number>(1);
@@ -674,6 +675,7 @@ export default function InventoryDashboard() {
         return;
       }
 
+      scanLockedRef.current = false;
       setScannerError(null);
       setScanFeedback(null);
 
@@ -689,10 +691,11 @@ export default function InventoryDashboard() {
           { facingMode: 'environment' },
           { fps: 10, qrbox: { width: 240, height: 140 } },
           async (decodedText: string) => {
-            if (!active) return;
+            if (!active || scanLockedRef.current) return;
             const cleaned = decodedText.trim();
             if (!cleaned) return;
 
+            scanLockedRef.current = true;
             setQuery(cleaned);
             setStatusFilter('ALL');
             setCategoryFilter('ALL');
@@ -700,7 +703,8 @@ export default function InventoryDashboard() {
 
             const currentMode = scanModeRef.current;
             if (currentMode === 'search') {
-              setIsScannerOpen(false);
+              await stopScanner();
+              if (active) setIsScannerOpen(false);
               return;
             }
 
@@ -710,12 +714,15 @@ export default function InventoryDashboard() {
 
             if (!matchedItem) {
               setScanFeedback(`No item found with SKU "${cleaned}". Search filter applied.`);
+              await stopScanner();
+              if (active) setIsScannerOpen(false);
               return;
             }
 
             const qty = Math.max(1, Number(scanQuantityRef.current) || 1);
             const delta = currentMode === 'add' ? qty : -qty;
             await adjustStock(matchedItem.id, delta);
+            await stopScanner();
             if (active) {
               setIsScannerOpen(false);
             }
