@@ -6,7 +6,6 @@ import { useEffect, useMemo, useState } from 'react';
 import {
   BarChart3,
   Box,
-  Circle,
   Download,
   Edit3,
   Lock,
@@ -54,6 +53,83 @@ type Category = {
 
 const colorOptions = ['Black', 'White', 'Navy', 'Olive', 'Cream', 'Red', 'Khaki'];
 
+const NAMED_COLORS: { name: string; hex: string }[] = [
+  { name: 'Black', hex: '#000000' },
+  { name: 'Charcoal', hex: '#333333' },
+  { name: 'Gray', hex: '#808080' },
+  { name: 'Silver', hex: '#C0C0C0' },
+  { name: 'White', hex: '#FFFFFF' },
+  { name: 'Cream', hex: '#FFFDD0' },
+  { name: 'Khaki', hex: '#C3B091' },
+  { name: 'Brown', hex: '#8B4513' },
+  { name: 'Maroon', hex: '#800000' },
+  { name: 'Red', hex: '#EF4444' },
+  { name: 'Coral', hex: '#FF7F50' },
+  { name: 'Orange', hex: '#F97316' },
+  { name: 'Gold', hex: '#EAB308' },
+  { name: 'Yellow', hex: '#FACC15' },
+  { name: 'Olive', hex: '#6B8E23' },
+  { name: 'Lime', hex: '#84CC16' },
+  { name: 'Green', hex: '#22C55E' },
+  { name: 'Teal', hex: '#14B8A6' },
+  { name: 'Cyan', hex: '#06B6D4' },
+  { name: 'Sky Blue', hex: '#38BDF8' },
+  { name: 'Blue', hex: '#3B82F6' },
+  { name: 'Navy', hex: '#1E3A8A' },
+  { name: 'Indigo', hex: '#4F46E5' },
+  { name: 'Purple', hex: '#A855F7' },
+  { name: 'Pink', hex: '#EC4899' },
+];
+
+const COLOR_NAME_TO_HEX: Record<string, string> = NAMED_COLORS.reduce(
+  (acc, entry) => {
+    acc[entry.name.toLowerCase()] = entry.hex;
+    return acc;
+  },
+  {} as Record<string, string>
+);
+
+function getColorSwatchHex(color: string): string {
+  if (color.startsWith('#')) return color;
+  return COLOR_NAME_TO_HEX[color.trim().toLowerCase()] || '#A1A1AA';
+}
+
+function ColorCircle({ color }: { color: string }) {
+  return (
+    <span
+      className="inline-block h-4 w-4 min-w-4 rounded-full border border-zinc-400/60 shrink-0"
+      style={{ backgroundColor: getColorSwatchHex(color), minWidth: '16px', minHeight: '16px' }}
+      aria-hidden="true"
+    />
+  );
+}
+
+function hexToColorName(hex: string): string {
+  const clean = hex.replace('#', '');
+  if (clean.length !== 6) return 'Custom';
+  const r = parseInt(clean.slice(0, 2), 16);
+  const g = parseInt(clean.slice(2, 4), 16);
+  const b = parseInt(clean.slice(4, 6), 16);
+  if ([r, g, b].some((n) => Number.isNaN(n))) return 'Custom';
+
+  let bestName = 'Custom';
+  let bestDist = Infinity;
+
+  for (const entry of NAMED_COLORS) {
+    const c = entry.hex.replace('#', '');
+    const cr = parseInt(c.slice(0, 2), 16);
+    const cg = parseInt(c.slice(2, 4), 16);
+    const cb = parseInt(c.slice(4, 6), 16);
+    const dist = (r - cr) ** 2 + (g - cg) ** 2 + (b - cb) ** 2;
+    if (dist < bestDist) {
+      bestDist = dist;
+      bestName = entry.name;
+    }
+  }
+
+  return bestName;
+}
+
 export default function InventoryDashboard() {
   const [user, setUser] = useState<User | null>(null);
   const [authLoading, setAuthLoading] = useState(true);
@@ -76,6 +152,7 @@ export default function InventoryDashboard() {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [form, setForm] = useState({ name: '', sku: '', category: 'Shirts', size: 'M', stock: '0', min: '5', colors: [] as string[] });
   const [newCategory, setNewCategory] = useState('');
+  const [pendingColor, setPendingColor] = useState('#84cc16');
   const [darkMode, setDarkMode] = useState(true);
 
   const actorName = useMemo(() => {
@@ -184,7 +261,17 @@ export default function InventoryDashboard() {
     }));
   };
 
-  // Fetch Inventory, Categories, and Audit Logs from Supabase
+  const approvePendingColor = (hexValue?: string) => {
+    const targetHex = hexValue || pendingColor;
+    const colorName = hexToColorName(targetHex);
+    setForm((current) => ({
+      ...current,
+      colors: current.colors.includes(colorName)
+        ? current.colors
+        : [...current.colors, colorName],
+    }));
+  };
+
   const fetchData = async () => {
     const { data: itemData } = await supabase.from('items').select('*').order('created_at', { ascending: false });
     if (itemData) {
@@ -503,6 +590,9 @@ export default function InventoryDashboard() {
     );
   }
 
+  const pendingColorName = hexToColorName(pendingColor);
+  const allSelectableColors = Array.from(new Set([...colorOptions, ...form.colors]));
+
   return (
     <main className={`min-h-screen ${t.bg} ${t.text} transition-colors duration-300 overflow-x-hidden`}>
       <div className="mx-auto flex max-w-7xl flex-col gap-6 px-3 sm:px-6 lg:px-8 py-4 sm:py-6">
@@ -680,9 +770,9 @@ export default function InventoryDashboard() {
                     {(item.colors || []).length > 0 && (
                       <div className="mt-3 flex flex-wrap gap-1.5 pt-2 border-t border-zinc-800/40">
                         {(item.colors || []).map((color) => (
-                          <span key={color} className={`flex items-center gap-1.5 rounded-full border ${t.badgeBg} px-2 py-0.5 text-[11px]`}>
-                            {color.startsWith('#') ? <span className="h-2 w-2 rounded-full border border-black/20" style={{ backgroundColor: color }} /> : <Circle size={8} fill="currentColor" />}
-                            {color}
+                          <span key={color} className={`flex items-center gap-2 rounded-full border ${t.badgeBg} px-2.5 py-0.5 text-[11px]`}>
+                            <ColorCircle color={color} />
+                            <span>{color}</span>
                           </span>
                         ))}
                       </div>
@@ -787,16 +877,46 @@ export default function InventoryDashboard() {
             </div>
 
             <div className="mt-4">
-              <label className="mb-2 block text-sm text-neutral-400">Colors</label>
+              <label className={`mb-2 block text-sm ${t.textMuted}`}>Colors</label>
               <div className="flex flex-wrap items-center gap-2">
-                {colorOptions.map((color) => {
+                {allSelectableColors.map((color) => {
                   const isSelected = form.colors.includes(color);
                   return (
-                    <button key={color} type="button" onClick={() => toggleColor(color)} className={`rounded-full border px-3 sm:px-4 py-1.5 text-xs sm:text-sm transition ${isSelected ? 'border-white bg-white font-medium text-black' : 'border-neutral-700 bg-transparent text-neutral-200'}`}>
-                      {color}
+                    <button
+                      key={color}
+                      type="button"
+                      onClick={() => toggleColor(color)}
+                      className={`flex items-center gap-2 rounded-full border px-3 sm:px-4 py-1.5 text-xs sm:text-sm transition ${
+                        isSelected
+                          ? `${t.tabActive} ${t.border} font-medium`
+                          : `${t.border} bg-transparent ${t.text} ${t.cardBgHover}`
+                      }`}
+                    >
+                      <ColorCircle color={color} />
+                      <span>{color}</span>
                     </button>
                   );
                 })}
+              </div>
+
+              <div className="mt-3 flex flex-wrap items-center gap-2">
+                <label className={`flex cursor-pointer items-center gap-2 rounded-2xl border ${t.border} ${t.inputBg} px-3 py-1.5 text-xs sm:text-sm ${t.text}`}>
+                  <input
+                    type="color"
+                    value={pendingColor}
+                    onChange={(e) => setPendingColor(e.target.value)}
+                    onBlur={(e) => approvePendingColor(e.target.value)}
+                    className="h-6 w-6 cursor-pointer rounded border-0 bg-transparent p-0"
+                  />
+                  <span>{pendingColorName}</span>
+                </label>
+                <button
+                  type="button"
+                  onClick={() => approvePendingColor()}
+                  className={`rounded-2xl border ${t.btnSecondary} px-3.5 py-1.5 text-xs sm:text-sm font-semibold transition`}
+                >
+                  OK
+                </button>
               </div>
             </div>
 
