@@ -2,11 +2,14 @@
 
 import { supabase } from './supabase';
 import type { User } from '@supabase/supabase-js';
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import Barcode from 'react-barcode';
 import {
   BarChart3,
   Box,
   Check,
+  ChevronDown,
+  ChevronUp,
   Download,
   Edit3,
   Lock,
@@ -16,7 +19,9 @@ import {
   Package2,
   Palette,
   Plus,
+  Printer,
   Search,
+  Sparkles,
   Sun,
   Trash2,
   TrendingUp,
@@ -215,6 +220,30 @@ function ColorCircle({ color, size = 'sm' }: { color: string; size?: 'sm' | 'md'
   );
 }
 
+function BarcodeScanIcon({ className = 'h-4 w-4' }: { className?: string }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+      aria-hidden="true"
+    >
+      <path d="M4 8V5a1 1 0 0 1 1-1h3" />
+      <path d="M16 4h3a1 1 0 0 1 1 1v3" />
+      <path d="M20 16v3a1 1 0 0 1-1 1h-3" />
+      <path d="M8 20H5a1 1 0 0 1-1-1v-3" />
+      <path d="M7 8v8" />
+      <path d="M10 8v8" />
+      <path d="M13 8v5" />
+      <path d="M17 8v8" />
+    </svg>
+  );
+}
+
 export default function InventoryDashboard() {
   const [user, setUser] = useState<User | null>(null);
   const [authLoading, setAuthLoading] = useState(true);
@@ -237,6 +266,13 @@ export default function InventoryDashboard() {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [form, setForm] = useState({ name: '', sku: '', category: 'Shirts', size: 'M', stock: '0', min: '5', colors: [] as string[] });
   const [newCategory, setNewCategory] = useState('');
+
+  const [expandedBarcodes, setExpandedBarcodes] = useState<Record<string, boolean>>({});
+
+  const [isScannerOpen, setIsScannerOpen] = useState(false);
+  const [scannerError, setScannerError] = useState<string | null>(null);
+  const scannerInstanceRef = useRef<any>(null);
+  const scannerRunningRef = useRef(false);
 
   const [isPickerOpen, setIsPickerOpen] = useState(false);
   const [hue, setHue] = useState(217);
@@ -272,6 +308,75 @@ export default function InventoryDashboard() {
 
     return () => subscription.unsubscribe();
   }, []);
+
+  useEffect(() => {
+    let active = true;
+
+    const stopScanner = async () => {
+      const instance = scannerInstanceRef.current;
+      if (instance && scannerRunningRef.current) {
+        scannerRunningRef.current = false;
+        try {
+          await instance.stop();
+        } catch {
+          // Ignore stop errors if already stopped
+        }
+        try {
+          instance.clear();
+        } catch {
+          // Ignore clear errors
+        }
+      }
+    };
+
+    const startScanner = async () => {
+      if (!isScannerOpen) {
+        await stopScanner();
+        return;
+      }
+
+      setScannerError(null);
+
+      try {
+        const mod = await import('html5-qrcode');
+        if (!active) return;
+
+        const Html5Qrcode = mod.Html5Qrcode;
+        const scanner = scannerInstanceRef.current || new Html5Qrcode('barcode-camera-reader');
+        scannerInstanceRef.current = scanner;
+
+        await scanner.start(
+          { facingMode: 'environment' },
+          { fps: 10, qrbox: { width: 240, height: 140 } },
+          (decodedText: string) => {
+            if (!active) return;
+            const cleaned = decodedText.trim();
+            setQuery(cleaned);
+            setStatusFilter('ALL');
+            setCategoryFilter('ALL');
+            setActiveTab('inventory');
+            setIsScannerOpen(false);
+          },
+          () => {
+            // Frame scan miss; continue scanning
+          }
+        );
+
+        scannerRunningRef.current = true;
+      } catch {
+        if (active) {
+          setScannerError('Camera access failed. Check browser camera permission or use HTTPS / localhost.');
+        }
+      }
+    };
+
+    startScanner();
+
+    return () => {
+      active = false;
+      stopScanner();
+    };
+  }, [isScannerOpen]);
 
   const t = {
     bg: darkMode ? 'bg-black' : 'bg-white',
@@ -395,6 +500,102 @@ export default function InventoryDashboard() {
     setHue(nextHue);
     setPickerHex(nextHex);
     ensureColorSelected(hexToColorName(nextHex));
+  };
+
+  const generateCustomSku = () => {
+    const prefix =
+      (form.category || 'TPD')
+        .replace(/[^a-zA-Z0-9]/g, '')
+        .slice(0, 3)
+        .toUpperCase() || 'TPD';
+    const randomCode = Math.floor(100000 + Math.random() * 900000);
+    setForm((current) => ({ ...current, sku: `${prefix}-${randomCode}` }));
+  };
+
+  const toggleBarcodeExpand = (itemId: string) => {
+    setExpandedBarcodes((current) => ({
+      ...current,
+      [itemId]: !current[itemId],
+    }));
+  };
+
+  const downloadBarcodePng = (item: InventoryItem) => {
+    if (!item.sku) return;
+    const container = document.getElementById(`barcode-label-${item.id}`);
+    const svg = container?.querySelector('svg');
+    if (!svg) return;
+
+    const svgData = new XMLSerializer().serializeToString(svg);
+    const svgBlob = new Blob([svgData], { type: 'image/svg+xml;charset=utf-8' });
+    const url = URL.createObjectURL(svgBlob);
+
+    const img = new Image();
+    img.onload = () => {
+      const padding = 20;
+      const canvas = document.createElement('canvas');
+      canvas.width = img.width + padding * 2;
+      canvas.height = img.height + padding * 2;
+
+      const ctx = canvas.getContext('2d');
+      if (ctx) {
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.drawImage(img, padding, padding);
+
+        const pngUrl = canvas.toDataURL('image/png');
+        const link = document.createElement('a');
+        const safeSku = item.sku.replace(/[^a-zA-Z0-9_-]/g, '_');
+        link.href = pngUrl;
+        link.download = `barcode-${safeSku}.png`;
+        link.click();
+      }
+      URL.revokeObjectURL(url);
+    };
+    img.src = url;
+  };
+
+  const printBarcodeLabel = (item: InventoryItem) => {
+    if (!item.sku) return;
+    const container = document.getElementById(`barcode-label-${item.id}`);
+    if (!container) return;
+
+    const printWin = window.open('', '_blank', 'width=420,height=320');
+    if (!printWin) return;
+
+    printWin.document.write(`
+      <html>
+        <head>
+          <title>Barcode - ${item.sku}</title>
+          <style>
+            body {
+              font-family: Arial, sans-serif;
+              display: flex;
+              flex-direction: column;
+              align-items: center;
+              justify-content: center;
+              min-height: 100vh;
+              margin: 0;
+              background: #ffffff;
+              color: #000000;
+            }
+            .name { font-size: 13px; font-weight: 700; margin-bottom: 4px; text-align: center; }
+            .meta { font-size: 11px; color: #444; margin-bottom: 8px; }
+          </style>
+        </head>
+        <body>
+          <div class="name">${item.name}</div>
+          <div class="meta">${item.category} &bull; Size: ${item.size}</div>
+          ${container.innerHTML}
+          <script>
+            window.onload = function () {
+              window.print();
+              window.close();
+            };
+          </script>
+        </body>
+      </html>
+    `);
+    printWin.document.close();
   };
 
   const fetchData = async () => {
@@ -746,7 +947,16 @@ export default function InventoryDashboard() {
             <button onClick={() => setDarkMode(!darkMode)} className={`hidden rounded-2xl border ${t.border} ${t.cardBg2} p-2.5 transition-all duration-200 hover:scale-105 active:scale-95 lg:block`}>
               {darkMode ? <Sun size={18} className="text-yellow-300 transition-transform duration-300 hover:rotate-45" /> : <Moon size={18} className="text-zinc-700 transition-transform duration-300 hover:-rotate-12" />}
             </button>
-            <button onClick={openCreateModal} className={`group col-span-2 sm:col-span-1 rounded-2xl border ${t.btnPrimary} px-4 py-3 sm:py-2.5 text-sm font-semibold transition-all duration-200 flex items-center justify-center gap-2`}>
+            <button
+              type="button"
+              onClick={() => setIsScannerOpen(true)}
+              title="Scan Barcode"
+              className={`group rounded-2xl border ${t.btnSecondary} px-3.5 py-3 sm:py-2.5 text-xs sm:text-sm font-semibold transition-all duration-200 flex items-center justify-center gap-2`}
+            >
+              <BarcodeScanIcon className="h-4 w-4 transition-transform duration-200 group-hover:scale-110" />
+              <span>Scan</span>
+            </button>
+            <button onClick={openCreateModal} className={`group rounded-2xl border ${t.btnPrimary} px-4 py-3 sm:py-2.5 text-sm font-semibold transition-all duration-200 flex items-center justify-center gap-2`}>
               <Plus size={16} className="transition-transform duration-200 group-hover:rotate-90" /> New Item
             </button>
             <button onClick={() => exportInventory('csv')} className={`group rounded-2xl border ${t.btnSecondary} px-3 sm:px-4 py-3 sm:py-2.5 text-xs sm:text-sm font-semibold transition-all duration-200 flex items-center justify-center gap-1.5 sm:gap-2`}>
@@ -838,11 +1048,20 @@ export default function InventoryDashboard() {
                 <h2 className="text-xl sm:text-2xl font-black">Inventory overview</h2>
                 <p className={`text-sm ${t.textMuted}`}>Responsive table with database sync</p>
               </div>
-              <div className="flex flex-col gap-2.5 sm:flex-row">
+              <div className="flex flex-col gap-2.5 sm:flex-row sm:flex-wrap sm:items-center">
                 <label className={`flex items-center gap-2 rounded-2xl border ${t.border} ${t.cardBg3} px-3 py-2 transition-colors duration-200 focus-within:border-zinc-500`}>
                   <Search size={16} className={iconClass} />
-                  <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search item, SKU or color" className={`w-full bg-transparent text-sm outline-none sm:w-56 ${t.text}`} />
+                  <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search item, SKU or color" className={`w-full bg-transparent text-sm outline-none sm:w-48 ${t.text}`} />
                 </label>
+                <button
+                  type="button"
+                  onClick={() => setIsScannerOpen(true)}
+                  title="Scan Barcode"
+                  className={`group inline-flex items-center justify-center gap-2 rounded-2xl border ${t.btnSecondary} px-3.5 py-2 text-sm font-semibold transition-all duration-150`}
+                >
+                  <BarcodeScanIcon className="h-4 w-4 transition-transform duration-150 group-hover:scale-110" />
+                  <span>Scan</span>
+                </button>
                 <select value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)} className={`cursor-pointer rounded-2xl border ${t.border} ${t.inputBg} px-3 py-2 text-sm ${t.text} transition-colors duration-200 hover:border-zinc-500`}>
                   <option value="ALL">All status</option>
                   <option value="LOW">Low</option>
@@ -864,50 +1083,100 @@ export default function InventoryDashboard() {
 
             {activeTab === 'inventory' ? (
               <div className="mt-5 space-y-3">
-                {filteredItems.map((item) => (
-                  <div key={item.id} className={`rounded-2xl border ${t.border} ${t.cardBgHover} p-3.5 sm:p-4 transition-all duration-200 hover:-translate-y-0.5 hover:shadow-lg`}>
-                    <div className="flex items-start justify-between gap-2">
-                      <div className="min-w-0 flex-1">
-                        <p className="font-semibold text-sm sm:text-base truncate">{item.name}</p>
-                        <p className={`text-xs ${t.textMuted2} truncate`}>{item.sku}</p>
-                      </div>
-                      <div className="flex items-center gap-2 shrink-0">
-                        <span className={`rounded-full border ${t.badgeBg} px-2 py-0.5 text-[11px]`}>{item.category}</span>
-                        <span className={`rounded-full px-2.5 py-0.5 text-[11px] font-semibold transition-transform duration-200 hover:scale-105 ${item.status === 'LOW' ? t.lowBg : t.okBg}`}>{item.status}</span>
-                      </div>
-                    </div>
-
-                    <div className="mt-3 flex items-center justify-between gap-4">
-                      <div className="flex-1">
-                        <div className="flex justify-between text-xs mb-1">
-                          <span className={t.textMuted}>Stock: <strong className={t.text}>{item.stock}</strong></span>
-                          <span className={t.textMuted}>Min: {item.min}</span>
+                {filteredItems.map((item) => {
+                  const isExpanded = Boolean(expandedBarcodes[item.id]);
+                  return (
+                    <div key={item.id} className={`rounded-2xl border ${t.border} ${t.cardBgHover} p-3.5 sm:p-4 transition-all duration-200 hover:-translate-y-0.5 hover:shadow-lg`}>
+                      <div className="flex items-start justify-between gap-2">
+                        <div className="min-w-0 flex-1">
+                          <p className="font-semibold text-sm sm:text-base truncate">{item.name}</p>
+                          <p className={`text-xs ${t.textMuted2} truncate`}>{item.sku}</p>
                         </div>
-                        <div className={`h-2 w-full rounded-full overflow-hidden ${t.progressBg}`}>
-                          <div className={`h-2 rounded-full transition-all duration-500 ease-out ${t.progressFill}`} style={{ width: `${Math.min(100, (item.stock / Math.max(item.min, 1)) * 100)}%` }} />
+                        <div className="flex items-center gap-2 shrink-0">
+                          <span className={`rounded-full border ${t.badgeBg} px-2 py-0.5 text-[11px]`}>{item.category}</span>
+                          <span className={`rounded-full px-2.5 py-0.5 text-[11px] font-semibold transition-transform duration-200 hover:scale-105 ${item.status === 'LOW' ? t.lowBg : t.okBg}`}>{item.status}</span>
                         </div>
                       </div>
 
-                      <div className="flex items-center gap-1.5 shrink-0 pt-3">
-                        <button onClick={() => adjustStock(item.id, -1)} className={`rounded-full border ${t.border} px-2.5 py-1 text-xs font-semibold transition-all duration-150 hover:scale-110 hover:bg-zinc-800 hover:text-white active:scale-90`}>-</button>
-                        <button onClick={() => adjustStock(item.id, 1)} className={`rounded-full border ${t.border} px-2.5 py-1 text-xs font-semibold transition-all duration-150 hover:scale-110 hover:bg-zinc-800 hover:text-white active:scale-90`}>+</button>
-                        <button onClick={() => openEditModal(item)} className={`rounded-full border ${t.border} p-1.5 transition-all duration-150 hover:scale-110 hover:bg-zinc-800 hover:text-white active:scale-90`}><Edit3 size={13} /></button>
-                        <button onClick={() => deleteItem(item.id)} className={`rounded-full border ${t.border} p-1.5 text-red-400 transition-all duration-150 hover:scale-110 hover:bg-red-950/60 active:scale-90`}><Trash2 size={13} /></button>
-                      </div>
-                    </div>
+                      <div className="mt-3 flex items-center justify-between gap-4">
+                        <div className="flex-1">
+                          <div className="flex justify-between text-xs mb-1">
+                            <span className={t.textMuted}>Stock: <strong className={t.text}>{item.stock}</strong></span>
+                            <span className={t.textMuted}>Min: {item.min}</span>
+                          </div>
+                          <div className={`h-2 w-full rounded-full overflow-hidden ${t.progressBg}`}>
+                            <div className={`h-2 rounded-full transition-all duration-500 ease-out ${t.progressFill}`} style={{ width: `${Math.min(100, (item.stock / Math.max(item.min, 1)) * 100)}%` }} />
+                          </div>
+                        </div>
 
-                    {(item.colors || []).length > 0 && (
-                      <div className="mt-3 flex flex-wrap gap-1.5 pt-2 border-t border-zinc-800/40">
-                        {(item.colors || []).map((color) => (
-                          <span key={color} className={`group flex items-center gap-2 rounded-full border ${t.badgeBg} px-2.5 py-0.5 text-[11px] transition-transform duration-150 hover:scale-105`}>
-                            <ColorCircle color={color} size="sm" />
-                            <span>{color}</span>
-                          </span>
-                        ))}
+                        <div className="flex items-center gap-1.5 shrink-0 pt-3">
+                          <button onClick={() => adjustStock(item.id, -1)} className={`rounded-full border ${t.border} px-2.5 py-1 text-xs font-semibold transition-all duration-150 hover:scale-110 hover:bg-zinc-800 hover:text-white active:scale-90`}>-</button>
+                          <button onClick={() => adjustStock(item.id, 1)} className={`rounded-full border ${t.border} px-2.5 py-1 text-xs font-semibold transition-all duration-150 hover:scale-110 hover:bg-zinc-800 hover:text-white active:scale-90`}>+</button>
+                          <button onClick={() => openEditModal(item)} className={`rounded-full border ${t.border} p-1.5 transition-all duration-150 hover:scale-110 hover:bg-zinc-800 hover:text-white active:scale-90`}><Edit3 size={13} /></button>
+                          <button onClick={() => deleteItem(item.id)} className={`rounded-full border ${t.border} p-1.5 text-red-400 transition-all duration-150 hover:scale-110 hover:bg-red-950/60 active:scale-90`}><Trash2 size={13} /></button>
+                        </div>
                       </div>
-                    )}
-                  </div>
-                ))}
+
+                      {(item.colors || []).length > 0 && (
+                        <div className="mt-3 flex flex-wrap gap-1.5 pt-2 border-t border-zinc-800/40">
+                          {(item.colors || []).map((color) => (
+                            <span key={color} className={`group flex items-center gap-2 rounded-full border ${t.badgeBg} px-2.5 py-0.5 text-[11px] transition-transform duration-150 hover:scale-105`}>
+                              <ColorCircle color={color} size="sm" />
+                              <span>{color}</span>
+                            </span>
+                          ))}
+                        </div>
+                      )}
+
+                      {item.sku && (
+                        <div className="mt-3 pt-2 border-t border-zinc-800/40">
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <button
+                              type="button"
+                              onClick={() => toggleBarcodeExpand(item.id)}
+                              className={`inline-flex items-center gap-1.5 rounded-xl border ${t.border} ${t.cardBg3} px-2.5 py-1 text-[11px] font-medium ${t.textMuted} transition-all duration-150 hover:scale-105 active:scale-95`}
+                            >
+                              {isExpanded ? <ChevronUp size={13} /> : <ChevronDown size={13} />}
+                              <span>{isExpanded ? 'Minimize Barcode' : 'Show Barcode'}</span>
+                            </button>
+
+                            <div className="flex flex-wrap items-center gap-1.5">
+                              <button
+                                type="button"
+                                onClick={() => downloadBarcodePng(item)}
+                                className={`inline-flex items-center gap-1.5 rounded-xl border ${t.btnSecondary} px-2.5 py-1 text-[11px] font-semibold transition-all duration-150`}
+                              >
+                                <Download size={12} />
+                                <span>Download</span>
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => printBarcodeLabel(item)}
+                                className={`inline-flex items-center gap-1.5 rounded-xl border ${t.btnSecondary} px-2.5 py-1 text-[11px] font-semibold transition-all duration-150`}
+                              >
+                                <Printer size={12} />
+                                <span>Print Barcode</span>
+                              </button>
+                            </div>
+                          </div>
+
+                          <div className={isExpanded ? 'mt-2.5 block' : 'hidden'}>
+                            <div id={`barcode-label-${item.id}`} className="inline-block rounded-xl bg-white px-2.5 py-1.5 text-black shadow-sm">
+                              <Barcode
+                                value={item.sku}
+                                format="CODE128"
+                                height={32}
+                                width={1.3}
+                                fontSize={11}
+                                margin={2}
+                              />
+                            </div>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
               </div>
             ) : (
               <div className={`mt-5 space-y-3 rounded-2xl border ${t.border} ${t.cardBg3} p-4 max-h-[500px] overflow-y-auto`}>
@@ -963,6 +1232,40 @@ export default function InventoryDashboard() {
         </section>
       </div>
 
+      {isScannerOpen && (
+        <div className={`fixed inset-0 z-50 flex items-center justify-center ${t.overlay} p-3 sm:p-4 overflow-y-auto transition-opacity duration-200`}>
+          <div className={`my-auto w-full max-w-md rounded-3xl border ${t.modalBg} p-4 sm:p-6 shadow-2xl transition-all duration-200`}>
+            <div className="flex items-center justify-between">
+              <div>
+                <p className={`text-xs uppercase tracking-[0.3em] ${t.textMuted}`}>CAMERA SCANNER</p>
+                <h3 className="text-xl font-black">Scan item barcode</h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => setIsScannerOpen(false)}
+                className={`rounded-full border ${t.border} px-3 py-1 text-xs transition-all duration-150 hover:scale-105 active:scale-95`}
+              >
+                Close
+              </button>
+            </div>
+
+            {scannerError && (
+              <div className="mt-4 rounded-2xl border border-red-900/50 bg-red-950/40 px-4 py-3 text-xs text-red-300">
+                {scannerError}
+              </div>
+            )}
+
+            <div className={`mt-4 overflow-hidden rounded-2xl border ${t.border} bg-black`}>
+              <div id="barcode-camera-reader" className="min-h-56 w-full" />
+            </div>
+
+            <p className={`mt-3 text-xs ${t.textMuted}`}>
+              Point your phone or webcam at a printed barcode or QR code. Matching SKUs fill the search filter automatically.
+            </p>
+          </div>
+        </div>
+      )}
+
       {isModalOpen && (
         <div className={`fixed inset-0 z-50 flex items-center justify-center ${t.overlay} p-3 sm:p-4 overflow-y-auto transition-opacity duration-200`}>
           <div className={`my-auto max-h-[90vh] w-full max-w-xl overflow-y-auto rounded-3xl border ${t.modalBg} p-4 sm:p-6 shadow-2xl transition-all duration-200`}>
@@ -979,10 +1282,25 @@ export default function InventoryDashboard() {
                 <span className={`mb-1.5 block ${t.textMuted}`}>Item Name</span>
                 <input value={form.name} onChange={(event) => setForm((current) => ({ ...current, name: event.target.value }))} className={`w-full rounded-2xl border ${t.border} ${t.inputBg} px-3 py-2 outline-none transition-colors duration-200 focus:border-zinc-500 ${t.text}`} />
               </label>
-              <label className="text-sm">
-                <span className={`mb-1.5 block ${t.textMuted}`}>SKU</span>
-                <input value={form.sku} onChange={(event) => setForm((current) => ({ ...current, sku: event.target.value }))} className={`w-full rounded-2xl border ${t.border} ${t.inputBg} px-3 py-2 outline-none transition-colors duration-200 focus:border-zinc-500 ${t.text}`} />
-              </label>
+              <div className="text-sm">
+                <div className="mb-1.5 flex items-center justify-between gap-2">
+                  <span className={t.textMuted}>SKU / Barcode</span>
+                  <button
+                    type="button"
+                    onClick={generateCustomSku}
+                    className={`inline-flex items-center gap-1 rounded-xl border ${t.border} ${t.cardBg3} px-2 py-0.5 text-[11px] font-semibold transition-all duration-150 hover:scale-105 active:scale-95`}
+                  >
+                    <Sparkles size={11} />
+                    <span>Auto SKU</span>
+                  </button>
+                </div>
+                <input
+                  value={form.sku}
+                  onChange={(event) => setForm((current) => ({ ...current, sku: event.target.value }))}
+                  placeholder="e.g. SHI-104920"
+                  className={`w-full rounded-2xl border ${t.border} ${t.inputBg} px-3 py-2 outline-none transition-colors duration-200 focus:border-zinc-500 ${t.text}`}
+                />
+              </div>
               <label className="text-sm">
                 <span className={`mb-1.5 block ${t.textMuted}`}>Category</span>
                 <select value={form.category} onChange={(event) => setForm((current) => ({ ...current, category: event.target.value }))} className={`w-full rounded-2xl border ${t.border} ${t.inputBg} px-3 py-2 outline-none transition-colors duration-200 focus:border-zinc-500 ${t.text}`}>
@@ -1004,6 +1322,22 @@ export default function InventoryDashboard() {
                 <input type="number" value={form.min} onChange={(event) => setForm((current) => ({ ...current, min: event.target.value }))} className={`w-full rounded-2xl border ${t.border} ${t.inputBg} px-3 py-2 outline-none transition-colors duration-200 focus:border-zinc-500 ${t.text}`} />
               </label>
             </div>
+
+            {form.sku.trim() && (
+              <div className="mt-4">
+                <span className={`mb-1.5 block text-xs ${t.textMuted}`}>Custom Barcode Preview</span>
+                <div className="inline-block rounded-2xl bg-white px-3 py-2 text-black shadow-sm">
+                  <Barcode
+                    value={form.sku.trim()}
+                    format="CODE128"
+                    height={36}
+                    width={1.4}
+                    fontSize={12}
+                    margin={2}
+                  />
+                </div>
+              </div>
+            )}
 
             <div className="mt-4">
               <label className={`mb-2 block text-sm ${t.textMuted}`}>Colors</label>
