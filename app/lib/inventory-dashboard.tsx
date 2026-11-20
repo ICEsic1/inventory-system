@@ -58,6 +58,8 @@ type Category = {
   name: string;
 };
 
+type ScanActionMode = 'search' | 'add' | 'deduct';
+
 const colorOptions = ['Black', 'White', 'Navy', 'Olive', 'Cream', 'Red', 'Khaki'];
 
 const NAMED_COLORS: { name: string; hex: string }[] = [
@@ -270,9 +272,15 @@ export default function InventoryDashboard() {
   const [expandedBarcodes, setExpandedBarcodes] = useState<Record<string, boolean>>({});
 
   const [isScannerOpen, setIsScannerOpen] = useState(false);
+  const [scanMode, setScanMode] = useState<ScanActionMode>('search');
+  const [scanQuantity, setScanQuantity] = useState<number>(1);
   const [scannerError, setScannerError] = useState<string | null>(null);
+  const [scanFeedback, setScanFeedback] = useState<string | null>(null);
   const scannerInstanceRef = useRef<any>(null);
   const scannerRunningRef = useRef(false);
+  const itemsRef = useRef<InventoryItem[]>([]);
+  const scanModeRef = useRef<ScanActionMode>('search');
+  const scanQuantityRef = useRef<number>(1);
 
   const [isPickerOpen, setIsPickerOpen] = useState(false);
   const [hue, setHue] = useState(217);
@@ -294,89 +302,47 @@ export default function InventoryDashboard() {
   }, [user]);
 
   useEffect(() => {
-    supabase.auth.getSession().then(({ data: { session } }) => {
-      setUser(session?.user ?? null);
-      setAuthLoading(false);
-    });
+    itemsRef.current = items;
+  }, [items]);
 
-    const {
-      data: { subscription },
-    } = supabase.auth.onAuthStateChange((_event, session) => {
-      setUser(session?.user ?? null);
-      setAuthLoading(false);
-    });
+  useEffect(() => {
+    scanModeRef.current = scanMode;
+  }, [scanMode]);
 
-    return () => subscription.unsubscribe();
-  }, []);
+  useEffect(() => {
+    scanQuantityRef.current = Math.max(1, Number(scanQuantity) || 1);
+  }, [scanQuantity]);
 
   useEffect(() => {
     let active = true;
 
-    const stopScanner = async () => {
-      const instance = scannerInstanceRef.current;
-      if (instance && scannerRunningRef.current) {
-        scannerRunningRef.current = false;
-        try {
-          await instance.stop();
-        } catch {
-          // Ignore stop errors if already stopped
-        }
-        try {
-          instance.clear();
-        } catch {
-          // Ignore clear errors
-        }
-      }
-    };
-
-    const startScanner = async () => {
-      if (!isScannerOpen) {
-        await stopScanner();
-        return;
-      }
-
-      setScannerError(null);
-
-      try {
-        const mod = await import('html5-qrcode');
+    supabase.auth
+      .getSession()
+      .then(({ data: { session } }) => {
         if (!active) return;
+        setUser(session?.user ?? null);
+      })
+      .catch(() => {
+        if (!active) return;
+        setUser(null);
+      })
+      .finally(() => {
+        if (active) setAuthLoading(false);
+      });
 
-        const Html5Qrcode = mod.Html5Qrcode;
-        const scanner = scannerInstanceRef.current || new Html5Qrcode('barcode-camera-reader');
-        scannerInstanceRef.current = scanner;
-
-        await scanner.start(
-          { facingMode: 'environment' },
-          { fps: 10, qrbox: { width: 240, height: 140 } },
-          (decodedText: string) => {
-            if (!active) return;
-            const cleaned = decodedText.trim();
-            setQuery(cleaned);
-            setStatusFilter('ALL');
-            setCategoryFilter('ALL');
-            setActiveTab('inventory');
-            setIsScannerOpen(false);
-          },
-          () => {
-            // Frame scan miss; continue scanning
-          }
-        );
-
-        scannerRunningRef.current = true;
-      } catch {
-        if (active) {
-          setScannerError('Camera access failed. Check browser camera permission or use HTTPS / localhost.');
-        }
-      }
-    };
-
-    startScanner();
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange((_event, session) => {
+      if (!active) return;
+      setUser(session?.user ?? null);
+      setAuthLoading(false);
+    });
 
     return () => {
       active = false;
-      stopScanner();
+      subscription.unsubscribe();
     };
-  }, [isScannerOpen]);
+  }, []);
 
   const t = {
     bg: darkMode ? 'bg-black' : 'bg-white',
@@ -664,6 +630,117 @@ export default function InventoryDashboard() {
     ]);
   };
 
+  const adjustStock = async (itemId: string, delta: number) => {
+    const item = itemsRef.current.find((entry) => entry.id === itemId) || items.find((entry) => entry.id === itemId);
+    if (!item) return;
+
+    const nextStock = Math.max(0, item.stock + delta);
+    const nextStatus = nextStock <= item.min ? 'LOW' : 'OK';
+
+    const { error } = await supabase.from('items').update({ stock: nextStock, status: nextStatus }).eq('id', itemId);
+    if (error) return;
+
+    await logAudit(
+      delta > 0 ? 'ADD STOCK' : 'REMOVE STOCK',
+      item.name,
+      `${delta > 0 ? '+' : ''}${delta} units (Now: ${nextStock}) by ${actorName}`
+    );
+    await fetchData();
+  };
+
+  useEffect(() => {
+    let active = true;
+
+    const stopScanner = async () => {
+      const instance = scannerInstanceRef.current;
+      if (instance && scannerRunningRef.current) {
+        scannerRunningRef.current = false;
+        try {
+          await instance.stop();
+        } catch {
+          // Ignore stop errors if already stopped
+        }
+        try {
+          instance.clear();
+        } catch {
+          // Ignore clear errors
+        }
+      }
+    };
+
+    const startScanner = async () => {
+      if (!isScannerOpen) {
+        await stopScanner();
+        return;
+      }
+
+      setScannerError(null);
+      setScanFeedback(null);
+
+      try {
+        const mod = await import('html5-qrcode');
+        if (!active) return;
+
+        const Html5Qrcode = mod.Html5Qrcode;
+        const scanner = scannerInstanceRef.current || new Html5Qrcode('barcode-camera-reader');
+        scannerInstanceRef.current = scanner;
+
+        await scanner.start(
+          { facingMode: 'environment' },
+          { fps: 10, qrbox: { width: 240, height: 140 } },
+          async (decodedText: string) => {
+            if (!active) return;
+            const cleaned = decodedText.trim();
+            if (!cleaned) return;
+
+            setQuery(cleaned);
+            setStatusFilter('ALL');
+            setCategoryFilter('ALL');
+            setActiveTab('inventory');
+
+            const currentMode = scanModeRef.current;
+            if (currentMode === 'search') {
+              setIsScannerOpen(false);
+              return;
+            }
+
+            const matchedItem = itemsRef.current.find(
+              (entry) => entry.sku.trim().toLowerCase() === cleaned.toLowerCase()
+            );
+
+            if (!matchedItem) {
+              setScanFeedback(`No item found with SKU "${cleaned}". Search filter applied.`);
+              return;
+            }
+
+            const qty = Math.max(1, Number(scanQuantityRef.current) || 1);
+            const delta = currentMode === 'add' ? qty : -qty;
+            await adjustStock(matchedItem.id, delta);
+            if (active) {
+              setIsScannerOpen(false);
+            }
+          },
+          () => {
+            // Frame scan miss; continue scanning
+          }
+        );
+
+        scannerRunningRef.current = true;
+      } catch {
+        if (active) {
+          setScannerError('Camera access failed. Check browser camera permission or use HTTPS / localhost.');
+        }
+      }
+    };
+
+    startScanner();
+
+    return () => {
+      active = false;
+      stopScanner();
+    };
+  }, [isScannerOpen]);
+
   const filteredItems = useMemo(() => {
     return items.filter((item) => {
       const matchesQuery = `${item.name} ${item.sku} ${(item.colors || []).join(' ')}`.toLowerCase().includes(query.toLowerCase());
@@ -741,24 +818,6 @@ export default function InventoryDashboard() {
     await fetchData();
     setIsPickerOpen(false);
     setIsModalOpen(false);
-  };
-
-  const adjustStock = async (itemId: string, delta: number) => {
-    const item = items.find((entry) => entry.id === itemId);
-    if (!item) return;
-
-    const nextStock = Math.max(0, item.stock + delta);
-    const nextStatus = nextStock <= item.min ? 'LOW' : 'OK';
-
-    const { error } = await supabase.from('items').update({ stock: nextStock, status: nextStatus }).eq('id', itemId);
-    if (error) return;
-
-    await logAudit(
-      delta > 0 ? 'ADD STOCK' : 'REMOVE STOCK',
-      item.name,
-      `${delta > 0 ? '+' : ''}${delta} units (Now: ${nextStock}) by ${actorName}`
-    );
-    await fetchData();
   };
 
   const deleteItem = async (itemId: string) => {
@@ -1249,9 +1308,89 @@ export default function InventoryDashboard() {
               </button>
             </div>
 
+            <div className="mt-4 grid grid-cols-3 gap-2">
+              <button
+                type="button"
+                onClick={() => {
+                  setScanMode('search');
+                  setScanFeedback(null);
+                }}
+                className={`rounded-2xl border px-3 py-2 text-xs font-semibold transition-all ${
+                  scanMode === 'search' ? t.tabActive : `${t.border} ${t.inputBg} ${t.textMuted}`
+                }`}
+              >
+                Find Item
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setScanMode('add');
+                  setScanFeedback(null);
+                }}
+                className={`rounded-2xl border px-3 py-2 text-xs font-semibold transition-all ${
+                  scanMode === 'add' ? t.tabActive : `${t.border} ${t.inputBg} ${t.textMuted}`
+                }`}
+              >
+                Add Stock
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setScanMode('deduct');
+                  setScanFeedback(null);
+                }}
+                className={`rounded-2xl border px-3 py-2 text-xs font-semibold transition-all ${
+                  scanMode === 'deduct' ? t.tabActive : `${t.border} ${t.inputBg} ${t.textMuted}`
+                }`}
+              >
+                Deduct Stock
+              </button>
+            </div>
+
+            {scanMode !== 'search' && (
+              <div className={`mt-3 flex items-center justify-between gap-3 rounded-2xl border ${t.border} ${t.cardBg3} px-3.5 py-2.5`}>
+                <span className={`text-xs font-semibold ${t.textMuted}`}>
+                  {scanMode === 'add' ? 'Quantity to add per scan' : 'Quantity to deduct per scan'}
+                </span>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setScanQuantity((q) => Math.max(1, (Number(q) || 1) - 1))}
+                    className={`rounded-xl border ${t.border} ${t.btnSecondary} px-2.5 py-1 text-xs font-bold`}
+                  >
+                    -
+                  </button>
+                  <input
+                    type="number"
+                    min={1}
+                    value={scanQuantity}
+                    onChange={(e) => {
+                      const valNum = parseInt(e.target.value, 10);
+                      setScanQuantity(Number.isNaN(valNum) ? 1 : Math.max(1, valNum));
+                    }}
+                    aria-label="Scan quantity"
+                    className={`w-16 rounded-xl border ${t.border} ${t.inputBg} px-2 py-1 text-center text-xs font-bold outline-none ${t.text}`}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setScanQuantity((q) => Math.max(1, (Number(q) || 1) + 1))}
+                    className={`rounded-xl border ${t.border} ${t.btnSecondary} px-2.5 py-1 text-xs font-bold`}
+                  >
+                    +
+                  </button>
+                </div>
+              </div>
+            )}
+
             {scannerError && (
               <div className="mt-4 rounded-2xl border border-red-900/50 bg-red-950/40 px-4 py-3 text-xs text-red-300">
                 {scannerError}
+              </div>
+            )}
+
+            {scanFeedback && (
+              <div className="mt-4 rounded-2xl border border-amber-900/50 bg-amber-950/40 px-4 py-3 text-xs text-amber-200">
+                {scanFeedback}
               </div>
             )}
 
@@ -1260,7 +1399,11 @@ export default function InventoryDashboard() {
             </div>
 
             <p className={`mt-3 text-xs ${t.textMuted}`}>
-              Point your phone or webcam at a printed barcode or QR code. Matching SKUs fill the search filter automatically.
+              {scanMode === 'add'
+                ? `Scanning a matching SKU adds +${Math.max(1, Number(scanQuantity) || 1)} unit(s) to stock automatically.`
+                : scanMode === 'deduct'
+                  ? `Scanning a matching SKU deducts -${Math.max(1, Number(scanQuantity) || 1)} unit(s) from stock automatically.`
+                  : 'Scanning fills the search box and filters matching items.'}
             </p>
           </div>
         </div>
