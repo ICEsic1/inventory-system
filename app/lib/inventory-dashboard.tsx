@@ -1781,38 +1781,63 @@ export default function InventoryDashboard() {
           });
         scannerInstanceRef.current = scanner;
 
-        await scanner.start(
-          {
-            facingMode: { ideal: 'environment' },
-            width: { ideal: 1280 },
-            height: { ideal: 720 },
+        const scanConfig = {
+          fps: 18,
+          aspectRatio: 1.777,
+          qrbox: (viewfinderWidth: number, viewfinderHeight: number) => {
+            const width = Math.min(340, Math.max(220, Math.floor(viewfinderWidth * 0.85)));
+            const height = Math.min(130, Math.max(85, Math.floor(viewfinderHeight * 0.42)));
+            return { width, height };
           },
-          {
-            fps: 18,
-            aspectRatio: 1.777,
-            qrbox: (viewfinderWidth: number, viewfinderHeight: number) => {
-              const width = Math.min(340, Math.max(220, Math.floor(viewfinderWidth * 0.85)));
-              const height = Math.min(130, Math.max(85, Math.floor(viewfinderHeight * 0.42)));
-              return { width, height };
-            },
-          },
-          async (decodedText: string) => {
-            if (!active || scanLockedRef.current) return;
-            const cleaned = decodedText.trim();
-            if (!cleaned) return;
+        };
 
-            scanLockedRef.current = true;
-            await processScannedCode(cleaned, stopScanner, true);
-          },
-          () => {
-            // Frame scan miss; continue scanning
+        const onDecoded = async (decodedText: string) => {
+          if (!active || scanLockedRef.current) return;
+          const cleaned = decodedText.trim();
+          if (!cleaned) return;
+
+          scanLockedRef.current = true;
+          await processScannedCode(cleaned, stopScanner, true);
+        };
+
+        const onFrameMiss = () => {
+          // Frame scan miss; continue scanning
+        };
+
+        let started = false;
+        try {
+          const cameras = await Html5Qrcode.getCameras();
+          if (!active) return;
+
+          if (cameras && cameras.length > 0) {
+            const rearCam =
+              cameras.find((c) => /back|rear|environment/i.test(c.label)) ||
+              cameras[cameras.length - 1];
+            try {
+              await scanner.start(rearCam.id, scanConfig, onDecoded, onFrameMiss);
+              started = true;
+            } catch {
+              await scanner.start(cameras[0].id, scanConfig, onDecoded, onFrameMiss);
+              started = true;
+            }
           }
-        );
+        } catch {
+          // Fall back to facingMode constraint below
+        }
 
-        scannerRunningRef.current = true;
-      } catch {
+        if (!started && active) {
+          await scanner.start({ facingMode: 'environment' }, scanConfig, onDecoded, onFrameMiss);
+        }
+
         if (active) {
-          setScannerError('Camera access failed. You can still type or scan with a USB/Bluetooth scanner below.');
+          scannerRunningRef.current = true;
+        }
+      } catch (err: any) {
+        if (active) {
+          const detail = err?.message ? ` (${err.message})` : '';
+          setScannerError(
+            `Camera access failed${detail}. Check browser camera permissions/HTTPS, or type/USB-scan a SKU below.`
+          );
         }
       }
     };
