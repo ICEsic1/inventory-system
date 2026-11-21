@@ -254,26 +254,91 @@ function hsvToHex(h: number, s: number, v: number): string {
   return rgbToHex((r1 + m) * 255, (g1 + m) * 255, (b1 + m) * 255);
 }
 
-function playScanFeedbackChime(success = true) {
+function playScanFeedbackChime(success = true, doubleBeep = false) {
   if (typeof window === 'undefined') return;
   try {
     const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
     if (AudioCtx) {
       const ctx = new AudioCtx();
-      const osc = ctx.createOscillator();
-      const gain = ctx.createGain();
-      osc.type = 'sine';
-      osc.frequency.setValueAtTime(success ? 880 : 320, ctx.currentTime);
-      gain.gain.setValueAtTime(0.08, ctx.currentTime);
-      gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.14);
-      osc.connect(gain);
-      gain.connect(ctx.destination);
-      osc.start();
-      osc.stop(ctx.currentTime + 0.14);
-      setTimeout(() => ctx.close().catch(() => {}), 220);
+      if (ctx.state === 'suspended') {
+        void ctx.resume();
+      }
+
+      const now = ctx.currentTime;
+
+      if (!success) {
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = 'sawtooth';
+        osc.frequency.setValueAtTime(310, now);
+        gain.gain.setValueAtTime(0.45, now);
+        gain.gain.exponentialRampToValueAtTime(0.001, now + 0.26);
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.start(now);
+        osc.stop(now + 0.26);
+        setTimeout(() => ctx.close().catch(() => {}), 340);
+      } else if (doubleBeep) {
+        const beepDuration = 0.11;
+        const gap = 0.08;
+        [0, beepDuration + gap].forEach((offset) => {
+          const startAt = now + offset;
+          const oscPrimary = ctx.createOscillator();
+          const oscHarmonic = ctx.createOscillator();
+          const gain = ctx.createGain();
+
+          oscPrimary.type = 'square';
+          oscHarmonic.type = 'square';
+          oscPrimary.frequency.setValueAtTime(1567.98, startAt);
+          oscHarmonic.frequency.setValueAtTime(3135.96, startAt);
+
+          gain.gain.setValueAtTime(0.85, startAt);
+          gain.gain.exponentialRampToValueAtTime(0.01, startAt + beepDuration);
+
+          oscPrimary.connect(gain);
+          oscHarmonic.connect(gain);
+          gain.connect(ctx.destination);
+
+          oscPrimary.start(startAt);
+          oscHarmonic.start(startAt);
+          oscPrimary.stop(startAt + beepDuration);
+          oscHarmonic.stop(startAt + beepDuration);
+        });
+        setTimeout(() => ctx.close().catch(() => {}), 460);
+      } else {
+        const duration = 0.18;
+        const oscPrimary = ctx.createOscillator();
+        const oscHarmonic = ctx.createOscillator();
+        const gain = ctx.createGain();
+
+        oscPrimary.type = 'square';
+        oscHarmonic.type = 'square';
+        oscPrimary.frequency.setValueAtTime(1567.98, now);
+        oscHarmonic.frequency.setValueAtTime(3135.96, now);
+
+        gain.gain.setValueAtTime(0.85, now);
+        gain.gain.exponentialRampToValueAtTime(0.01, now + duration);
+
+        oscPrimary.connect(gain);
+        oscHarmonic.connect(gain);
+        gain.connect(ctx.destination);
+
+        oscPrimary.start(now);
+        oscHarmonic.start(now);
+        oscPrimary.stop(now + duration);
+        oscHarmonic.stop(now + duration);
+        setTimeout(() => ctx.close().catch(() => {}), 300);
+      }
     }
+
     if (typeof navigator !== 'undefined' && typeof navigator.vibrate === 'function') {
-      navigator.vibrate(success ? 55 : [40, 40, 40]);
+      if (!success) {
+        navigator.vibrate([50, 40, 50]);
+      } else if (doubleBeep) {
+        navigator.vibrate([90, 70, 90]);
+      } else {
+        navigator.vibrate(140);
+      }
     }
   } catch {
     // Ignore audio/vibration errors on restricted browsers
@@ -489,6 +554,12 @@ export default function InventoryDashboard() {
   const [categories, setCategories] = useState<Category[]>([]);
   const [auditLog, setAuditLog] = useState<AuditEntry[]>([]);
 
+  // Audit select & clear all state
+  const [auditSelectMode, setAuditSelectMode] = useState(false);
+  const [selectedAuditIds, setSelectedAuditIds] = useState<Set<string>>(new Set());
+  const [confirmClearAllAudit, setConfirmClearAllAudit] = useState(false);
+  const [isClearingAudit, setIsClearingAudit] = useState(false);
+
   const [notifications, setNotifications] = useState<AppNotification[]>([]);
   const [topLowStockBanner, setTopLowStockBanner] = useState<(AppNotification & { closing?: boolean }) | null>(null);
   const topBannerTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -519,7 +590,6 @@ export default function InventoryDashboard() {
   const [lastScannedSummary, setLastScannedSummary] = useState<string | null>(null);
   const [manualWedgeSku, setManualWedgeSku] = useState('');
   const [customCardQty, setCustomCardQty] = useState<Record<string, number>>({});
-  const [restockQtyByItem, setRestockQtyByItem] = useState<Record<string, number>>({});
   const [copiedRestockList, setCopiedRestockList] = useState(false);
 
   // Barcode label customization state: format (compact vs full) & batch copies count
@@ -1123,7 +1193,7 @@ export default function InventoryDashboard() {
           ctx.font = 'bold 10px Arial, sans-serif';
           ctx.textAlign = 'center';
           ctx.fillText(
-            `${(item.category || 'ITEM').toUpperCase()} • SIZE ${item.size || '-'} • ₱${UNIT_ESTIMATED_PRICE}`,
+            `${(item.category || 'ITEM').toUpperCase()} • SIZE ${item.size || '-'}`,
             canvas.width / 2,
             yCursor
           );
@@ -1202,7 +1272,7 @@ export default function InventoryDashboard() {
           isFull
             ? `<div class="top-meta"><span>${escapeHtml(item.category || 'Item')}</span> &bull; <span>Size: ${escapeHtml(
                 item.size || '-'
-              )}</span> &bull; <strong>₱${UNIT_ESTIMATED_PRICE}</strong></div>`
+              )}</span></div>`
             : ''
         }
         <div class="item-row">
@@ -1466,11 +1536,74 @@ export default function InventoryDashboard() {
   const deleteAuditLog = async (auditId: string) => {
     const prevLog = auditLog;
     setAuditLog((prev) => prev.filter((entry) => entry.id !== auditId));
+    setSelectedAuditIds((prev) => {
+      const next = new Set(prev);
+      next.delete(auditId);
+      return next;
+    });
     const { error } = await supabase.from('audit_logs').delete().eq('id', auditId);
     if (error) {
       setAuditLog(prevLog);
       alert('Error deleting audit log: ' + error.message);
     }
+  };
+
+  const toggleAuditSelection = (auditId: string) => {
+    setSelectedAuditIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(auditId)) {
+        next.delete(auditId);
+      } else {
+        next.add(auditId);
+      }
+      return next;
+    });
+  };
+
+  const toggleSelectAllAudit = () => {
+    if (selectedAuditIds.size === auditLog.length && auditLog.length > 0) {
+      setSelectedAuditIds(new Set());
+    } else {
+      setSelectedAuditIds(new Set(auditLog.map((entry) => entry.id)));
+    }
+  };
+
+  const deleteSelectedAuditLogs = async () => {
+    if (selectedAuditIds.size === 0 || isClearingAudit) return;
+    setIsClearingAudit(true);
+    const idsToDelete = Array.from(selectedAuditIds);
+    const prevLog = auditLog;
+
+    setAuditLog((prev) => prev.filter((entry) => !selectedAuditIds.has(entry.id)));
+    setSelectedAuditIds(new Set());
+
+    const dbIds = idsToDelete.filter((id) => !id.startsWith('opt-'));
+    if (dbIds.length > 0) {
+      const { error } = await supabase.from('audit_logs').delete().in('id', dbIds);
+      if (error) {
+        setAuditLog(prevLog);
+        alert('Error deleting selected audit logs: ' + error.message);
+      }
+    }
+    setIsClearingAudit(false);
+  };
+
+  const clearAllAuditLogs = async () => {
+    if (auditLog.length === 0 || isClearingAudit) return;
+    setIsClearingAudit(true);
+    const prevLog = auditLog;
+
+    setAuditLog([]);
+    setSelectedAuditIds(new Set());
+    setAuditSelectMode(false);
+    setConfirmClearAllAudit(false);
+
+    const { error } = await supabase.from('audit_logs').delete().not('id', 'is', null);
+    if (error) {
+      setAuditLog(prevLog);
+      alert('Error clearing audit logs: ' + error.message);
+    }
+    setIsClearingAudit(false);
   };
 
   const adjustStock = async (itemId: string, delta: number, source: 'button' | 'scan' = 'button') => {
@@ -1534,12 +1667,13 @@ export default function InventoryDashboard() {
     const currentMode = scanModeRef.current;
     const keepOpen = continuousScanRef.current;
     const playChime = scanSoundEnabledRef.current;
+    const unlockDelay = keepOpen ? 500 : 850;
 
     if (currentMode === 'search') {
       const match = itemsRef.current.find(
         (entry) => entry.sku.trim().toLowerCase() === cleaned.toLowerCase()
       );
-      if (playChime) playScanFeedbackChime(true);
+      if (playChime) playScanFeedbackChime(true, keepOpen);
       const summary = match ? `${match.name} (${match.stock} in stock)` : `Filter: "${cleaned}"`;
       setLastScannedSummary(summary);
       setScanSuccessBanner(`Scanned "${cleaned}" — ${summary}`);
@@ -1548,12 +1682,12 @@ export default function InventoryDashboard() {
       if (!keepOpen) {
         if (stopCameraFn) await stopCameraFn();
         if (allowCloseModal) {
-          setTimeout(() => closeScannerAnimated(), 850);
+          setTimeout(() => closeScannerAnimated(), unlockDelay);
         }
       } else {
         setTimeout(() => {
           scanLockedRef.current = false;
-        }, 1100);
+        }, unlockDelay);
       }
       return;
     }
@@ -1563,7 +1697,7 @@ export default function InventoryDashboard() {
     );
 
     if (!matchedItem) {
-      if (playChime) playScanFeedbackChime(false);
+      if (playChime) playScanFeedbackChime(false, false);
       setScanFeedback(`No item found with SKU "${cleaned}". Search filter applied.`);
       pushNotification('SKU Not Found', `No exact SKU match for "${cleaned}".`, 'low_stock');
 
@@ -1586,7 +1720,7 @@ export default function InventoryDashboard() {
     const resultingStock = result?.nextStock ?? Math.max(0, matchedItem.stock + delta);
     const actualDelta = result?.actualDelta ?? delta;
 
-    if (playChime) playScanFeedbackChime(true);
+    if (playChime) playScanFeedbackChime(true, keepOpen);
     const label = `${matchedItem.name} (${actualDelta >= 0 ? `+${actualDelta}` : actualDelta} → ${resultingStock})`;
     setLastScannedSummary(label);
     setScanSuccessBanner(`Scanned ${label}`);
@@ -1594,12 +1728,12 @@ export default function InventoryDashboard() {
     if (!keepOpen) {
       if (stopCameraFn) await stopCameraFn();
       if (allowCloseModal) {
-        setTimeout(() => closeScannerAnimated(), 850);
+        setTimeout(() => closeScannerAnimated(), unlockDelay);
       }
     } else {
       setTimeout(() => {
         scanLockedRef.current = false;
-      }, 1100);
+      }, unlockDelay);
     }
   };
 
@@ -1638,13 +1772,30 @@ export default function InventoryDashboard() {
         const mod = await import('html5-qrcode');
         if (!active) return;
 
-        const Html5Qrcode = mod.Html5Qrcode;
-        const scanner = scannerInstanceRef.current || new Html5Qrcode('barcode-camera-reader');
+        const { Html5Qrcode, Html5QrcodeSupportedFormats } = mod;
+        const scanner =
+          scannerInstanceRef.current ||
+          new Html5Qrcode('barcode-camera-reader', {
+            formatsToSupport: [Html5QrcodeSupportedFormats.CODE_128],
+            verbose: false,
+          });
         scannerInstanceRef.current = scanner;
 
         await scanner.start(
-          { facingMode: 'environment' },
-          { fps: 10, qrbox: { width: 240, height: 140 } },
+          {
+            facingMode: { ideal: 'environment' },
+            width: { ideal: 1280 },
+            height: { ideal: 720 },
+          },
+          {
+            fps: 18,
+            aspectRatio: 1.777,
+            qrbox: (viewfinderWidth: number, viewfinderHeight: number) => {
+              const width = Math.min(340, Math.max(220, Math.floor(viewfinderWidth * 0.85)));
+              const height = Math.min(130, Math.max(85, Math.floor(viewfinderHeight * 0.42)));
+              return { width, height };
+            },
+          },
           async (decodedText: string) => {
             if (!active || scanLockedRef.current) return;
             const cleaned = decodedText.trim();
@@ -1706,9 +1857,8 @@ export default function InventoryDashboard() {
   const copyRestockOrder = async () => {
     if (lowStockItems.length === 0) return;
     const lines = lowStockItems.map((item) => {
-      const needed = Math.max(1, item.min - item.stock);
       const colorPart = item.colors.length ? ` [${item.colors.join(', ')}]` : '';
-      return `- ${item.name} (${item.sku || 'No SKU'}) • Size: ${item.size}${colorPart} • Stock: ${item.stock}/${item.min} → Order +${needed}`;
+      return `- ${item.name} (${item.sku || 'No SKU'}) • Size: ${item.size}${colorPart} • Stock: ${item.stock}/${item.min} → Needed Stock`;
     });
     const text = `THE PRINTING DEPOT — RESTOCK LIST\n${lines.join('\n')}`;
     try {
@@ -2670,7 +2820,7 @@ export default function InventoryDashboard() {
                         <div className="flex items-start justify-between gap-2">
                           <div className="min-w-0 flex-1">
                             <p className="font-semibold text-sm sm:text-base truncate">{item.name}</p>
-                            <p className={`text-xs ${t.textMuted2} truncate`}>{item.sku} &bull; Size: {item.size}</p>
+                            <p className={`text-xs ${t.textMuted2} truncate`}>{item.sku} &bull; {item.size}</p>
                           </div>
                           <div className="flex items-center gap-2 shrink-0">
                             <span className={`rounded-full border ${t.badgeBg} px-2 py-0.5 text-[11px]`}>{item.category}</span>
@@ -2815,7 +2965,7 @@ export default function InventoryDashboard() {
                               >
                                 {labelFormat === 'full' && (
                                   <span className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-zinc-600">
-                                    {item.category || 'Item'} &bull; Size {item.size || '-'} &bull; ₱{UNIT_ESTIMATED_PRICE}
+                                    {item.category || 'Item'} &bull; Size {item.size || '-'}
                                   </span>
                                 )}
                                 <div className="mb-1 flex items-center justify-center gap-1.5">
@@ -2850,30 +3000,137 @@ export default function InventoryDashboard() {
               </div>
             ) : (
               <div className={`mt-5 space-y-3 rounded-2xl border ${t.border} ${t.cardBg3} p-4 max-h-[500px] overflow-y-auto`}>
-                {auditLog.map((entry) => (
-                  <div key={entry.id} className={`flex items-center justify-between gap-3 rounded-2xl border ${t.border} ${t.cardBgHover} p-3 transition-all duration-200 ease-out motion-reduce:transition-none hover:translate-x-0.5`}>
-                    <div className="min-w-0 flex-1">
-                      <p className="font-semibold text-sm truncate">{entry.item}</p>
-                      <p className={`text-xs ${t.textMuted} truncate`}>{entry.detail}</p>
-                      {entry.user && <p className="mt-0.5 text-[11px] font-medium text-emerald-400 truncate">Handled by: {entry.user}</p>}
-                    </div>
-                    <div className="flex items-center gap-2 shrink-0">
-                      <div className={`text-right text-xs ${t.textMuted2}`}>
-                        <p className="font-semibold">{entry.action}</p>
-                        <p className="tabular-nums">{entry.time}</p>
-                      </div>
+                {auditLog.length > 0 && (
+                  <div className={`flex flex-wrap items-center justify-between gap-2 pb-3 border-b ${t.border}`}>
+                    <div className="flex flex-wrap items-center gap-2">
                       <button
                         type="button"
-                        onClick={() => deleteAuditLog(entry.id)}
-                        title="Delete audit log"
-                        aria-label="Delete audit log"
-                        className={`tpd-click-press rounded-xl border ${t.border} p-1.5 text-red-400 transition-all duration-150 hover:scale-110 hover:bg-red-950/60`}
+                        onClick={() => {
+                          setAuditSelectMode((prev) => {
+                            if (prev) setSelectedAuditIds(new Set());
+                            return !prev;
+                          });
+                        }}
+                        className={`tpd-click-press inline-flex items-center gap-1.5 rounded-xl border px-3 py-1.5 text-xs font-semibold ${
+                          auditSelectMode ? t.tabActive : `${t.border} ${t.inputBg} ${t.textMuted} hover:text-white`
+                        }`}
+                      >
+                        <Check size={13} />
+                        <span>{auditSelectMode ? 'Cancel Select' : 'Select'}</span>
+                      </button>
+
+                      {auditSelectMode && (
+                        <>
+                          <button
+                            type="button"
+                            onClick={toggleSelectAllAudit}
+                            className={`tpd-click-press rounded-xl border ${t.border} ${t.inputBg} px-3 py-1.5 text-xs font-semibold ${t.textMuted} hover:text-white`}
+                          >
+                            {selectedAuditIds.size === auditLog.length ? 'Deselect All' : 'Select All'}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={deleteSelectedAuditLogs}
+                            disabled={selectedAuditIds.size === 0 || isClearingAudit}
+                            className="tpd-click-press inline-flex items-center gap-1.5 rounded-xl border border-red-500/50 bg-red-600/20 px-3 py-1.5 text-xs font-bold text-red-300 transition-all hover:bg-red-600/30 disabled:opacity-40 tabular-nums"
+                          >
+                            <Trash2 size={13} />
+                            <span>Delete Selected ({selectedAuditIds.size})</span>
+                          </button>
+                        </>
+                      )}
+                    </div>
+
+                    {!confirmClearAllAudit ? (
+                      <button
+                        type="button"
+                        onClick={() => setConfirmClearAllAudit(true)}
+                        disabled={isClearingAudit}
+                        className="tpd-click-press inline-flex items-center gap-1.5 rounded-xl border border-red-500/50 bg-red-600/20 px-3 py-1.5 text-xs font-bold text-red-300 transition-all hover:bg-red-600/30 disabled:opacity-40"
                       >
                         <Trash2 size={13} />
+                        <span>Clear All</span>
                       </button>
-                    </div>
+                    ) : (
+                      <div className="flex items-center gap-1.5">
+                        <button
+                          type="button"
+                          onClick={clearAllAuditLogs}
+                          disabled={isClearingAudit}
+                          className="tpd-click-press rounded-xl border border-red-500 bg-red-600 px-3 py-1.5 text-xs font-bold text-white hover:bg-red-700 disabled:opacity-60"
+                        >
+                          {isClearingAudit ? 'Clearing...' : 'Confirm Clear'}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setConfirmClearAllAudit(false)}
+                          className={`tpd-click-press rounded-xl border ${t.btnSecondary} px-2.5 py-1.5 text-xs font-semibold`}
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    )}
                   </div>
-                ))}
+                )}
+
+                {auditLog.length === 0 ? (
+                  <p className={`py-8 text-center text-sm ${t.textMuted}`}>No audit events recorded yet.</p>
+                ) : (
+                  auditLog.map((entry) => {
+                    const isChecked = selectedAuditIds.has(entry.id);
+                    return (
+                      <div
+                        key={entry.id}
+                        onClick={() => {
+                          if (auditSelectMode) toggleAuditSelection(entry.id);
+                        }}
+                        className={`flex items-center justify-between gap-3 rounded-2xl border p-3 transition-all duration-200 ease-out motion-reduce:transition-none hover:translate-x-0.5 ${
+                          auditSelectMode ? 'cursor-pointer' : ''
+                        } ${
+                          isChecked
+                            ? 'border-red-500/60 bg-red-950/20'
+                            : `${t.border} ${t.cardBgHover}`
+                        }`}
+                      >
+                        <div className="flex items-center gap-3 min-w-0 flex-1">
+                          {auditSelectMode && (
+                            <input
+                              type="checkbox"
+                              checked={isChecked}
+                              onChange={() => toggleAuditSelection(entry.id)}
+                              onClick={(e) => e.stopPropagation()}
+                              aria-label={`Select audit log for ${entry.item}`}
+                              className="h-4 w-4 rounded border-zinc-600 accent-red-500 cursor-pointer shrink-0"
+                            />
+                          )}
+                          <div className="min-w-0 flex-1">
+                            <p className="font-semibold text-sm truncate">{entry.item}</p>
+                            <p className={`text-xs ${t.textMuted} truncate`}>{entry.detail}</p>
+                            {entry.user && <p className="mt-0.5 text-[11px] font-medium text-emerald-400 truncate">Handled by: {entry.user}</p>}
+                          </div>
+                        </div>
+                        <div className="flex items-center gap-2 shrink-0">
+                          <div className={`text-right text-xs ${t.textMuted2}`}>
+                            <p className="font-semibold">{entry.action}</p>
+                            <p className="tabular-nums">{entry.time}</p>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              deleteAuditLog(entry.id);
+                            }}
+                            title="Delete audit log"
+                            aria-label="Delete audit log"
+                            className={`tpd-click-press rounded-xl border ${t.border} p-1.5 text-red-400 transition-all duration-150 hover:scale-110 hover:bg-red-950/60`}
+                          >
+                            <Trash2 size={13} />
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })
+                )}
               </div>
             )}
           </div>
@@ -2938,53 +3195,17 @@ export default function InventoryDashboard() {
                 )}
               </div>
               <div className="mt-4 space-y-2.5">
-                {lowStockItems.map((item) => {
-                  const neededToMin = Math.max(1, item.min - item.stock);
-                  const customRestockAmt = Math.max(1, Number(restockQtyByItem[item.id]) || neededToMin);
-
-                  return (
-                    <div key={item.id} className={`rounded-2xl border ${t.needsRestockBorder} ${t.needsRestockBg} p-3 text-sm transition-all duration-200 ease-out motion-reduce:transition-none hover:-translate-y-0.5`}>
-                      <div className="flex items-center justify-between gap-2">
-                        <div className="min-w-0">
-                          <p className="font-semibold truncate">{item.name}</p>
-                          <p className={`text-xs ${t.textMuted} tabular-nums`}>{item.sku || 'No SKU'} &bull; {item.stock}/{item.min} stock</p>
-                        </div>
-                        <button
-                          type="button"
-                          onClick={() => adjustStock(item.id, neededToMin, 'button')}
-                          title={`Restock +${neededToMin} to reach min (${item.min})`}
-                          className={`shrink-0 rounded-xl border ${t.btnPrimary} px-2.5 py-1 text-xs font-bold tabular-nums`}
-                        >
-                          To Min (+{neededToMin})
-                        </button>
-                      </div>
-
-                      <div className="mt-2.5 flex items-center justify-end gap-1.5">
-                        <input
-                          type="number"
-                          min={1}
-                          value={customRestockAmt}
-                          onChange={(e) => {
-                            const valNum = parseInt(e.target.value, 10);
-                            setRestockQtyByItem((prev) => ({
-                              ...prev,
-                              [item.id]: Number.isNaN(valNum) ? 1 : Math.max(1, valNum),
-                            }));
-                          }}
-                          aria-label={`Restock quantity for ${item.name}`}
-                          className={`w-16 rounded-xl border ${t.border} ${t.inputBg} px-2 py-1 text-center text-xs font-bold tabular-nums outline-none ${t.text}`}
-                        />
-                        <button
-                          type="button"
-                          onClick={() => adjustStock(item.id, customRestockAmt, 'button')}
-                          className={`tpd-click-press rounded-xl border ${t.btnSecondary} px-2.5 py-1 text-xs font-bold tabular-nums`}
-                        >
-                          Add +{customRestockAmt}
-                        </button>
-                      </div>
+                {lowStockItems.map((item) => (
+                  <div key={item.id} className={`flex items-center justify-between gap-2 rounded-2xl border ${t.needsRestockBorder} ${t.needsRestockBg} p-3 text-sm transition-all duration-200 ease-out motion-reduce:transition-none hover:-translate-y-0.5`}>
+                    <div className="min-w-0">
+                      <p className="font-semibold truncate">{item.name}</p>
+                      <p className={`text-xs ${t.textMuted} tabular-nums`}>{item.sku || 'No SKU'} &bull; {item.stock}/{item.min} stock</p>
                     </div>
-                  );
-                })}
+                    <span className="shrink-0 rounded-xl border border-red-400 bg-red-600 px-2.5 py-1 text-xs font-extrabold text-white shadow-sm">
+                      Needed Stock
+                    </span>
+                  </div>
+                ))}
               </div>
             </div>
           </div>
@@ -3299,8 +3520,8 @@ export default function InventoryDashboard() {
 
             <p className={`mt-3 text-xs ${t.textMuted}`}>
               {continuousScan
-                ? 'Continuous scan is active: scan multiple items in a row without reopening the camera.'
-                : 'Single-scan mode: closes automatically after a successful scan.'}
+                ? 'Continuous scan is active (double beep): scan multiple items in a row without reopening the camera.'
+                : 'Single-scan mode (single beep): closes automatically after a successful scan.'}
             </p>
           </div>
         </div>
@@ -3397,7 +3618,7 @@ export default function InventoryDashboard() {
                 >
                   {labelFormat === 'full' && (
                     <span className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-zinc-600">
-                      {form.category || 'Item'} &bull; Size {form.size || '-'} &bull; ₱{UNIT_ESTIMATED_PRICE}
+                      {form.category || 'Item'} &bull; Size {form.size || '-'}
                     </span>
                   )}
                   <div className="mb-1 flex items-center justify-center gap-1.5">
