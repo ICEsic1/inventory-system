@@ -1,11 +1,14 @@
 'use client';
 
+import backgroundImg from '../Background.png';
 import { supabase } from './supabase';
 import type { User } from '@supabase/supabase-js';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import Barcode from 'react-barcode';
 import {
   AlertTriangle,
+  ArrowDownLeft,
+  ArrowUpRight,
   Bell,
   Box,
   Check,
@@ -15,21 +18,26 @@ import {
   Copy,
   Download,
   Edit3,
+  FileText,
+  Layers,
+  List,
   Lock,
   LogOut,
   Mail,
   Maximize2,
   Minimize2,
   Moon,
+  MoreHorizontal,
   Package2,
   Palette,
   Plus,
   Printer,
+  RefreshCw,
   Repeat,
   RotateCcw,
   Search,
   Settings,
-  Sparkles,
+  ShoppingBag,
   Sun,
   Trash2,
   TrendingUp,
@@ -38,8 +46,9 @@ import {
   Warehouse,
   X,
 } from 'lucide-react';
-import { ResponsiveContainer, BarChart, Bar, XAxis, YAxis, Tooltip, CartesianGrid } from 'recharts';
 import Papa from 'papaparse';
+
+type ItemStatus = 'OUT OF STOCK' | 'LOW' | 'OK';
 
 type InventoryItem = {
   id: string;
@@ -49,8 +58,19 @@ type InventoryItem = {
   size: string;
   stock: number;
   min: number;
-  status: 'LOW' | 'OK';
+  status: ItemStatus;
   colors: string[];
+};
+
+type MovementMeta = {
+  sku?: string;
+  size?: string;
+  colors?: string[];
+  previousStock?: number;
+  newStock?: number;
+  note?: string;
+  docNo?: string;
+  partyName?: string;
 };
 
 type AuditEntry = {
@@ -60,6 +80,9 @@ type AuditEntry = {
   detail: string;
   user: string;
   time: string;
+  direction?: 'INCOMING' | 'OUTGOING' | 'OTHER';
+  qtyDelta?: number;
+  meta?: MovementMeta;
 };
 
 type Category = {
@@ -67,8 +90,35 @@ type Category = {
   name: string;
 };
 
+type StockDocumentLine = {
+  id: string;
+  itemId?: string;
+  name: string;
+  sku: string;
+  category: string;
+  size: string;
+  colors: string[];
+  qty: number;
+  isNewCatalogItem?: boolean;
+};
+
+type StockDocument = {
+  id: string;
+  kind: 'INCOMING' | 'OUTGOING';
+  docNo: string;
+  partyName: string;
+  dateTime: string;
+  description: string;
+  goods: StockDocumentLine[];
+  status: 'PENDING' | 'COMPLETED';
+  createdAt: string;
+  completedAt?: string;
+};
+
 type ScanActionMode = 'search' | 'add' | 'deduct';
 type BarcodeLabelFormat = 'compact' | 'full';
+type InventoryViewMode = 'list' | 'grouped';
+type OverviewTab = 'inventory' | 'incoming' | 'outgoing' | 'audit';
 
 type AppNotification = {
   id: string;
@@ -87,26 +137,105 @@ type CascadeSelectOption = {
 
 const UNIT_ESTIMATED_PRICE = 80;
 const colorOptions = ['Black', 'White', 'Navy', 'Olive', 'Cream', 'Red', 'Khaki'];
+const DEFAULT_SUPPLIERS = ['Select', 'Metro Print Supply', 'Cebu Apparel Wholesaler', 'Pacific Paper & Ink', 'Direct Factory', 'Custom'];
+const DEFAULT_CUSTOMERS = ['Select', 'Walk-in Customer', 'Corporate Client', 'Event Organizer', 'Retail Partner', 'Custom'];
 
-function formatBarcodeItemSizeLabel(name?: string, size?: string): string {
-  const cleanName = (name || 'ITEM')
-    .toUpperCase()
-    .replace(/[^A-Z0-9]+/g, '')
-    .trim() || 'ITEM';
-  const cleanSize = (size || '')
-    .toUpperCase()
-    .replace(/[^A-Z0-9]+/g, '')
-    .trim();
-  return cleanSize ? `${cleanName}_${cleanSize}` : cleanName;
+function formatCurrentDocDateTime(): string {
+  const now = new Date();
+  const yyyy = now.getFullYear();
+  const mm = String(now.getMonth() + 1).padStart(2, '0');
+  const dd = String(now.getDate()).padStart(2, '0');
+  const hh = String(now.getHours()).padStart(2, '0');
+  const min = String(now.getMinutes()).padStart(2, '0');
+  return `${yyyy}/${mm}/${dd} ${hh}:${min}`;
 }
 
-function escapeHtml(text: string): string {
-  return text
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
+function computeItemStatus(stock: number, min: number): ItemStatus {
+  if (stock <= 0) return 'OUT OF STOCK';
+  if (stock <= min) return 'LOW';
+  return 'OK';
+}
+
+function mapStockDocumentRow(row: any): StockDocument {
+  return {
+    id: String(row.id),
+    kind: row.kind === 'OUTGOING' ? 'OUTGOING' : 'INCOMING',
+    docNo: row.doc_no || 'No.1',
+    partyName: row.party_name ?? 'Select',
+    dateTime: row.date_time || formatCurrentDocDateTime(),
+    description: row.description ?? '',
+    goods: Array.isArray(row.goods) ? row.goods : [],
+    status: row.status === 'COMPLETED' ? 'COMPLETED' : 'PENDING',
+    createdAt: row.created_at || new Date().toISOString(),
+    completedAt: row.completed_at ?? undefined,
+  };
+}
+
+function parseMovementMeta(rawDetail: string, rawAction: string): {
+  direction: 'INCOMING' | 'OUTGOING' | 'OTHER';
+  qtyDelta: number;
+  cleanDetail: string;
+  meta: MovementMeta;
+} {
+  let cleanDetail = rawDetail || '';
+  let parsedMeta: MovementMeta = {};
+
+  const markerMatch = cleanDetail.match(/\|\|META:(\{.*\})$/);
+  if (markerMatch) {
+    cleanDetail = cleanDetail.replace(/\|\|META:\{.*\}$/, '').trim();
+    try {
+      const jsonObj = JSON.parse(markerMatch[1]);
+      if (jsonObj && typeof jsonObj === 'object') {
+        parsedMeta = jsonObj as MovementMeta;
+      }
+    } catch {
+      // Ignore malformed metadata suffix
+    }
+  }
+
+  const upperAction = (rawAction || '').toUpperCase();
+  let direction: 'INCOMING' | 'OUTGOING' | 'OTHER' = 'OTHER';
+  let qtyDelta = 0;
+
+  const qtyMatch = cleanDetail.match(/([+-]\d+)\s*units?/i);
+  if (qtyMatch) {
+    const qty = parseInt(qtyMatch[1], 10);
+    if (!Number.isNaN(qty)) {
+      if (qty > 0) {
+        direction = 'INCOMING';
+        qtyDelta = qty;
+      } else if (qty < 0) {
+        direction = 'OUTGOING';
+        qtyDelta = Math.abs(qty);
+      }
+    }
+  }
+
+  if (direction === 'OTHER') {
+    if (upperAction.includes('ADD') || upperAction.includes('INCOMING') || upperAction.includes('PROCUREMENT')) {
+      direction = 'INCOMING';
+    } else if (
+      upperAction.includes('REMOVE') ||
+      upperAction.includes('DEDUCT') ||
+      upperAction.includes('OUTGOING') ||
+      upperAction.includes('ORDER')
+    ) {
+      direction = 'OUTGOING';
+    }
+  }
+
+  if (qtyDelta === 0 && typeof parsedMeta.previousStock === 'number' && typeof parsedMeta.newStock === 'number') {
+    const diff = parsedMeta.newStock - parsedMeta.previousStock;
+    if (diff > 0) {
+      direction = 'INCOMING';
+      qtyDelta = diff;
+    } else if (diff < 0) {
+      direction = 'OUTGOING';
+      qtyDelta = Math.abs(diff);
+    }
+  }
+
+  return { direction, qtyDelta, cleanDetail, meta: parsedMeta };
 }
 
 const NAMED_COLORS: { name: string; hex: string }[] = [
@@ -137,7 +266,20 @@ const NAMED_COLORS: { name: string; hex: string }[] = [
   { name: 'Pink', hex: '#EC4899' },
 ];
 
-const FEATURED_SWATCHES = ['Black', 'White', 'Red', 'Orange', 'Yellow', 'Lime', 'Green', 'Cyan', 'Blue', 'Purple', 'Pink', 'Navy'];
+const FEATURED_SWATCHES = [
+  'Black',
+  'White',
+  'Red',
+  'Orange',
+  'Yellow',
+  'Lime',
+  'Green',
+  'Cyan',
+  'Blue',
+  'Purple',
+  'Pink',
+  'Navy',
+];
 
 const COLOR_NAME_TO_HEX: Record<string, string> = NAMED_COLORS.reduce(
   (acc, entry) => {
@@ -254,16 +396,29 @@ function hsvToHex(h: number, s: number, v: number): string {
   return rgbToHex((r1 + m) * 255, (g1 + m) * 255, (b1 + m) * 255);
 }
 
+let sharedAudioCtx: AudioContext | null = null;
+
+function getSharedAudioContext(): AudioContext | null {
+  if (typeof window === 'undefined') return null;
+  const AudioCtx =
+    window.AudioContext ||
+    (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+  if (!AudioCtx) return null;
+
+  if (!sharedAudioCtx || sharedAudioCtx.state === 'closed') {
+    sharedAudioCtx = new AudioCtx();
+  }
+  if (sharedAudioCtx.state === 'suspended') {
+    void sharedAudioCtx.resume().catch(() => {});
+  }
+  return sharedAudioCtx;
+}
+
 function playScanFeedbackChime(success = true, doubleBeep = false) {
   if (typeof window === 'undefined') return;
   try {
-    const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
-    if (AudioCtx) {
-      const ctx = new AudioCtx();
-      if (ctx.state === 'suspended') {
-        void ctx.resume();
-      }
-
+    const ctx = getSharedAudioContext();
+    if (ctx) {
       const now = ctx.currentTime;
 
       if (!success) {
@@ -277,7 +432,10 @@ function playScanFeedbackChime(success = true, doubleBeep = false) {
         gain.connect(ctx.destination);
         osc.start(now);
         osc.stop(now + 0.26);
-        setTimeout(() => ctx.close().catch(() => {}), 340);
+        setTimeout(() => {
+          osc.disconnect();
+          gain.disconnect();
+        }, 300);
       } else if (doubleBeep) {
         const beepDuration = 0.11;
         const gap = 0.08;
@@ -303,8 +461,12 @@ function playScanFeedbackChime(success = true, doubleBeep = false) {
           oscHarmonic.start(startAt);
           oscPrimary.stop(startAt + beepDuration);
           oscHarmonic.stop(startAt + beepDuration);
+          setTimeout(() => {
+            oscPrimary.disconnect();
+            oscHarmonic.disconnect();
+            gain.disconnect();
+          }, (offset + beepDuration) * 1000 + 60);
         });
-        setTimeout(() => ctx.close().catch(() => {}), 460);
       } else {
         const duration = 0.18;
         const oscPrimary = ctx.createOscillator();
@@ -327,7 +489,11 @@ function playScanFeedbackChime(success = true, doubleBeep = false) {
         oscHarmonic.start(now);
         oscPrimary.stop(now + duration);
         oscHarmonic.stop(now + duration);
-        setTimeout(() => ctx.close().catch(() => {}), 300);
+        setTimeout(() => {
+          oscPrimary.disconnect();
+          oscHarmonic.disconnect();
+          gain.disconnect();
+        }, 240);
       }
     }
 
@@ -343,6 +509,407 @@ function playScanFeedbackChime(success = true, doubleBeep = false) {
   } catch {
     // Ignore audio/vibration errors on restricted browsers
   }
+}
+
+function formatBarcodeItemSizeLabel(name?: string, size?: string): string {
+  const cleanName =
+    (name || 'ITEM')
+      .toUpperCase()
+      .replace(/[^A-Z0-9]+/g, '')
+      .trim() || 'ITEM';
+  const cleanSize = (size || '')
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, '')
+    .trim();
+  return cleanSize ? `${cleanName}_${cleanSize}` : cleanName;
+}
+
+function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function buildSingleBarcodeCardHtml(
+  item: InventoryItem,
+  copies: number,
+  labelFormat: BarcodeLabelFormat
+): string {
+  const container = document.getElementById(`barcode-label-${item.id}`);
+  const itemSizeLabel = formatBarcodeItemSizeLabel(item.name, item.size);
+  const colors = item.colors || [];
+  const isFull = labelFormat === 'full';
+  const barcodeInnerHtml = container?.innerHTML || '';
+
+  const colorCirclesHtml = colors
+    .map(
+      (color) =>
+        `<span class="color-dot" title="${escapeHtml(color)}" style="background:${escapeHtml(
+          getColorFill(color)
+        )};"></span>`
+    )
+    .join('');
+
+  const singleCardHtml = `
+    <div class="label-card ${isFull ? 'label-full' : 'label-compact'}">
+      ${
+        isFull
+          ? `<div class="top-meta"><span>${escapeHtml(item.category || 'Item')}</span> &bull; <span>Size/Type: ${escapeHtml(
+              item.size || '-'
+            )}</span></div>`
+          : ''
+      }
+      <div class="item-row">
+        <span class="item-mark">${escapeHtml(itemSizeLabel)}</span>
+        ${colorCirclesHtml ? `<span class="color-dots">${colorCirclesHtml}</span>` : ''}
+      </div>
+      <div class="barcode-box">${barcodeInnerHtml}</div>
+      ${
+        isFull && colors.length > 0
+          ? `<div class="color-names">Colors: ${escapeHtml(colors.join(', '))}</div>`
+          : ''
+      }
+    </div>
+  `;
+
+  return singleCardHtml.repeat(copies);
+}
+
+function openPrintWindowWithCards(titleText: string, cardsHtml: string) {
+  const printWin = window.open('', '_blank', 'width=640,height=480');
+  if (!printWin) return;
+
+  printWin.document.write(`
+    <html>
+      <head>
+        <title>${escapeHtml(titleText)}</title>
+        <style>
+          body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 12px;
+            background: #ffffff;
+            color: #000000;
+          }
+          .sheet {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            align-items: flex-start;
+            justify-content: flex-start;
+          }
+          .label-card {
+            border: 1px solid #d4d4d8;
+            border-radius: 8px;
+            padding: 8px 10px;
+            background: #ffffff;
+            display: inline-flex;
+            flex-direction: column;
+            align-items: center;
+            box-sizing: border-box;
+            break-inside: avoid;
+          }
+          .label-compact {
+            min-width: 170px;
+          }
+          .label-full {
+            min-width: 230px;
+            padding: 10px 12px;
+          }
+          .top-meta {
+            font-size: 10px;
+            color: #3f3f46;
+            margin-bottom: 4px;
+            text-align: center;
+          }
+          .item-row {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 6px;
+            margin-bottom: 4px;
+          }
+          .item-mark {
+            font-size: 12px;
+            font-weight: 800;
+            letter-spacing: 0.06em;
+            color: #000000;
+          }
+          .color-dots {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+          }
+          .color-dot {
+            display: inline-block;
+            width: 11px;
+            height: 11px;
+            border-radius: 9999px;
+            border: 1px solid #27272a;
+          }
+          .barcode-box {
+            display: flex;
+            justify-content: center;
+          }
+          .color-names {
+            margin-top: 4px;
+            font-size: 10px;
+            color: #27272a;
+            text-align: center;
+          }
+        </style>
+      </head>
+      <body>
+        <div class="sheet">${cardsHtml}</div>
+        <script>
+          window.onload = function () {
+            window.print();
+            window.close();
+          };
+        </script>
+      </body>
+    </html>
+  `);
+  printWin.document.close();
+}
+
+function openInventoryPdfReport(
+  reportTitle: string,
+  subtitle: string,
+  sourceItems: InventoryItem[]
+) {
+  if (typeof window === 'undefined') return;
+  const printWin = window.open('', '_blank', 'width=900,height=680');
+  if (!printWin) return;
+
+  const totalUnits = sourceItems.reduce((sum, item) => sum + item.stock, 0);
+  const totalEstValue = sourceItems.reduce((sum, item) => sum + item.stock * UNIT_ESTIMATED_PRICE, 0);
+  const lowOrOutCount = sourceItems.filter(
+    (item) => item.status === 'LOW' || item.status === 'OUT OF STOCK'
+  ).length;
+  const generatedAt = new Date().toLocaleString();
+
+  const rowsHtml =
+    sourceItems.length === 0
+      ? `<tr><td colspan="8" style="text-align:center;padding:18px;color:#64748b;">No inventory items in this selection.</td></tr>`
+      : sourceItems
+          .map((item) => {
+            const statusColor =
+              item.status === 'OUT OF STOCK'
+                ? 'background:#fee2e2;color:#991b1b;border:1px solid #fca5a5;'
+                : item.status === 'LOW'
+                  ? 'background:#fef3c7;color:#92400e;border:1px solid #fcd34d;'
+                  : 'background:#dcfce7;color:#166534;border:1px solid #86efac;';
+
+            const colorDots = (item.colors || [])
+              .map(
+                (c) =>
+                  `<span style="display:inline-flex;align-items:center;gap:4px;margin-right:6px;"><span style="display:inline-block;width:9px;height:9px;border-radius:999px;background:${escapeHtml(
+                    getColorFill(c)
+                  )};border:1px solid #3f3f46;"></span>${escapeHtml(c)}</span>`
+              )
+              .join('');
+
+            return `
+              <tr>
+                <td style="font-weight:700;">${escapeHtml(item.name)}</td>
+                <td style="font-family:monospace;font-size:11px;">${escapeHtml(item.sku || '-')}</td>
+                <td>${escapeHtml(item.category || '-')}</td>
+                <td>${escapeHtml(item.size || '-')}</td>
+                <td>${colorDots || '<span style="color:#94a3b8;">-</span>'}</td>
+                <td style="text-align:right;font-weight:700;">${item.stock}</td>
+                <td style="text-align:right;">${item.min}</td>
+                <td style="text-align:center;"><span style="display:inline-block;padding:2px 8px;border-radius:999px;font-size:10px;font-weight:700;${statusColor}">${escapeHtml(
+                  item.status
+                )}</span></td>
+              </tr>
+            `;
+          })
+          .join('');
+
+  printWin.document.write(`
+    <html>
+      <head>
+        <title>${escapeHtml(reportTitle)} - THE PRINTING DEPOT</title>
+        <style>
+          @page {
+            size: A4 portrait;
+            margin: 14mm;
+          }
+          body {
+            font-family: Arial, Helvetica, sans-serif;
+            margin: 0;
+            color: #0f172a;
+            background: #ffffff;
+          }
+          .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            border-bottom: 2px solid #0f172a;
+            padding-bottom: 10px;
+            margin-bottom: 14px;
+          }
+          .brand {
+            font-size: 10px;
+            font-weight: 800;
+            letter-spacing: 0.16em;
+            text-transform: uppercase;
+            color: #475569;
+          }
+          .title {
+            font-size: 20px;
+            font-weight: 900;
+            margin: 2px 0;
+          }
+          .subtitle {
+            font-size: 12px;
+            color: #334155;
+          }
+          .meta {
+            text-align: right;
+            font-size: 11px;
+            color: #475569;
+          }
+          .summary {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 8px;
+            margin-bottom: 14px;
+          }
+          .stat-box {
+            border: 1px solid #cbd5e1;
+            border-radius: 8px;
+            padding: 8px 10px;
+            background: #f8fafc;
+          }
+          .stat-label {
+            font-size: 10px;
+            text-transform: uppercase;
+            color: #64748b;
+            font-weight: 700;
+          }
+          .stat-val {
+            font-size: 15px;
+            font-weight: 800;
+            margin-top: 2px;
+          }
+          table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 11.5px;
+          }
+          th {
+            background: #0f172a;
+            color: #ffffff;
+            text-align: left;
+            padding: 7px 8px;
+            font-size: 10.5px;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+          }
+          td {
+            padding: 6px 8px;
+            border-bottom: 1px solid #e2e8f0;
+            vertical-align: middle;
+          }
+          tr:nth-child(even) td {
+            background: #f8fafc;
+          }
+          tr {
+            break-inside: avoid;
+          }
+        </style>
+      </head>
+      <body>
+        <div class="header">
+          <div>
+            <div class="brand">THE PRINTING DEPOT • INVENTORY REPORT</div>
+            <div class="title">${escapeHtml(reportTitle)}</div>
+            <div class="subtitle">${escapeHtml(subtitle)}</div>
+          </div>
+          <div class="meta">
+            <div><strong>Generated:</strong> ${escapeHtml(generatedAt)}</div>
+            <div><strong>Total Records:</strong> ${sourceItems.length}</div>
+          </div>
+        </div>
+
+        <div class="summary">
+          <div class="stat-box">
+            <div class="stat-label">Items Listed</div>
+            <div class="stat-val">${sourceItems.length}</div>
+          </div>
+          <div class="stat-box">
+            <div class="stat-label">Total Stock Units</div>
+            <div class="stat-val">${totalUnits}</div>
+          </div>
+          <div class="stat-box">
+            <div class="stat-label">Est. Value</div>
+            <div class="stat-val">₱${totalEstValue.toLocaleString()}</div>
+          </div>
+          <div class="stat-box">
+            <div class="stat-label">Low / Out Stock</div>
+            <div class="stat-val">${lowOrOutCount}</div>
+          </div>
+        </div>
+
+        <table>
+          <thead>
+            <tr>
+              <th>Item Name</th>
+              <th>SKU</th>
+              <th>Category</th>
+              <th>Size / Type</th>
+              <th>Colors</th>
+              <th style="text-align:right;">Stock</th>
+              <th style="text-align:right;">Min</th>
+              <th style="text-align:center;">Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${rowsHtml}
+          </tbody>
+        </table>
+
+        <script>
+          window.onload = function () {
+            window.print();
+            window.close();
+          };
+        </script>
+      </body>
+    </html>
+  `);
+  printWin.document.close();
+}
+
+function FrostedBackgroundLayer({ darkMode }: { darkMode: boolean }) {
+  return (
+    <div
+      aria-hidden="true"
+      className="pointer-events-none fixed inset-0 z-0 overflow-hidden"
+    >
+      <div
+        className="h-full w-full scale-105 bg-cover bg-center bg-no-repeat transition-all duration-500"
+        style={{
+          backgroundImage: `url('${backgroundImg.src}')`,
+          filter: darkMode
+            ? 'blur(3px) brightness(0.72) saturate(1.15)'
+            : 'blur(3px) brightness(0.96) saturate(1.1)',
+        }}
+      />
+      <div
+        className={`absolute inset-0 ${
+          darkMode
+            ? 'bg-gradient-to-br from-black/35 via-zinc-950/20 to-black/45'
+            : 'bg-gradient-to-br from-white/35 via-white/20 to-white/45'
+        }`}
+      />
+    </div>
+  );
 }
 
 function ColorCircle({ color, size = 'sm' }: { color: string; size?: 'sm' | 'md' | 'lg' }) {
@@ -366,10 +933,10 @@ function PrintingDepotLogo({ darkMode, size = 'md' }: { darkMode: boolean; size?
 
   return (
     <div
-      className={`tpd-logo-mark tpd-click-press relative flex ${boxSize} shrink-0 items-center justify-center overflow-hidden border transition-transform duration-300 ease-out motion-reduce:transition-none hover:scale-105 ${
+      className={`tpd-logo-mark tpd-click-press relative flex ${boxSize} shrink-0 items-center justify-center overflow-hidden border backdrop-blur-xl saturate-150 transition-transform duration-300 ease-out motion-reduce:transition-none hover:scale-105 ${
         darkMode
-          ? 'border-zinc-700/80 bg-zinc-900 text-white shadow-md'
-          : 'border-zinc-300 bg-zinc-100 text-black shadow-sm'
+          ? 'border-white/20 bg-white/10 text-white shadow-md ring-1 ring-inset ring-white/10'
+          : 'border-black/15 bg-white/55 text-black shadow-sm ring-1 ring-inset ring-black/5'
       }`}
     >
       <img
@@ -468,12 +1035,12 @@ function CascadeSelect({
   }, [open, closing]);
 
   const triggerStyle = darkMode
-    ? 'border-zinc-800 bg-black/50 text-white hover:border-zinc-600 hover:bg-zinc-900/80'
-    : 'border-zinc-300 bg-zinc-100 text-black hover:border-zinc-400 hover:bg-zinc-200/80';
+    ? 'border-white/20 bg-zinc-900/40 text-white backdrop-blur-xl saturate-150 ring-1 ring-inset ring-white/10 hover:border-white/35 hover:bg-zinc-900/55'
+    : 'border-black/20 bg-white/80 text-zinc-950 backdrop-blur-xl saturate-150 ring-1 ring-inset ring-black/5 hover:border-black/35 hover:bg-white';
 
   const menuStyle = darkMode
-    ? 'border-zinc-800 bg-zinc-950/95 text-white shadow-2xl'
-    : 'border-zinc-300 bg-white/95 text-black shadow-2xl';
+    ? 'border-white/20 bg-zinc-950/85 text-white shadow-2xl ring-1 ring-inset ring-white/10'
+    : 'border-black/20 bg-white/95 text-zinc-950 shadow-2xl ring-1 ring-inset ring-black/5';
 
   return (
     <div ref={containerRef} className={`relative ${fullWidth ? 'w-full' : 'inline-block'}`}>
@@ -494,9 +1061,9 @@ function CascadeSelect({
 
       {open && (
         <div
-          className={`${closing ? 'tpd-cascade-panel-exit' : 'tpd-cascade-panel-enter'} absolute left-0 top-full mt-2 z-40 ${
+          className={`${closing ? 'tpd-cascade-panel-exit' : 'tpd-cascade-panel-enter'} absolute left-0 top-full mt-2 z-50 ${
             fullWidth ? 'w-full' : 'min-w-[205px]'
-          } rounded-3xl border ${menuStyle} p-2 backdrop-blur-md transition-all duration-300 ease-out motion-reduce:transition-none`}
+          } rounded-3xl border ${menuStyle} p-2 backdrop-blur-2xl saturate-150 transition-all duration-300 ease-out motion-reduce:transition-none`}
         >
           <div className="max-h-64 overflow-y-auto overflow-x-visible space-y-1 p-0.5">
             {options.map((opt, idx) => {
@@ -521,11 +1088,11 @@ function CascadeSelect({
                   } tpd-cascade-option flex w-full items-center justify-between gap-2 rounded-2xl border px-3.5 py-2 text-left text-sm font-medium ${
                     isSelected
                       ? darkMode
-                        ? 'border-zinc-500 bg-white text-black font-semibold shadow-md'
-                        : 'border-zinc-700 bg-black text-white font-semibold shadow-md'
+                        ? 'border-white/40 bg-white text-black font-semibold shadow-md'
+                        : 'border-black/40 bg-zinc-900 text-white font-semibold shadow-md'
                       : darkMode
-                        ? 'border-transparent text-zinc-200 hover:border-zinc-600 hover:bg-zinc-900 hover:text-white'
-                        : 'border-transparent text-zinc-800 hover:border-zinc-400 hover:bg-zinc-100 hover:text-black'
+                        ? 'border-transparent text-zinc-200 hover:border-white/20 hover:bg-white/10 hover:text-white'
+                        : 'border-transparent text-zinc-800 hover:border-black/15 hover:bg-black/5 hover:text-black'
                   }`}
                 >
                   <span className="truncate">{opt.label}</span>
@@ -554,11 +1121,42 @@ export default function InventoryDashboard() {
   const [categories, setCategories] = useState<Category[]>([]);
   const [auditLog, setAuditLog] = useState<AuditEntry[]>([]);
 
-  // Audit select & clear all state
+  const [documents, setDocuments] = useState<StockDocument[]>([]);
+  const [docModalOpen, setDocModalOpen] = useState(false);
+  const [docModalClosing, setDocModalClosing] = useState(false);
+  const [editingDocId, setEditingDocId] = useState<string | null>(null);
+  const [docKind, setDocKind] = useState<'INCOMING' | 'OUTGOING'>('INCOMING');
+  const [docNo, setDocNo] = useState('No.1');
+  const [docPartyName, setDocPartyName] = useState('Select');
+  const [docCustomParty, setDocCustomParty] = useState('');
+  const [docDateTime, setDocDateTime] = useState(formatCurrentDocDateTime());
+  const [docDescription, setDocDescription] = useState('');
+  const [docGoods, setDocGoods] = useState<StockDocumentLine[]>([]);
+  const [docGoodsSearch, setDocGoodsSearch] = useState('');
+  const [docInfoExpanded, setDocInfoExpanded] = useState(true);
+  const [goodsInfoExpanded, setGoodsInfoExpanded] = useState(true);
+  const [addGoodPickerOpen, setAddGoodPickerOpen] = useState(false);
+  const [addGoodCatalogQuery, setAddGoodCatalogQuery] = useState('');
+  const [inlineNewGoodOpen, setInlineNewGoodOpen] = useState(false);
+  const [inlineNewGood, setInlineNewGood] = useState({
+    name: '',
+    sku: '',
+    category: 'Shirts',
+    size: 'M',
+    qty: '1',
+    colors: [] as string[],
+  });
+  const [batchScanActive, setBatchScanActive] = useState(false);
+  const [docMenuOpenId, setDocMenuOpenId] = useState<string | null>(null);
+
   const [auditSelectMode, setAuditSelectMode] = useState(false);
   const [selectedAuditIds, setSelectedAuditIds] = useState<Set<string>>(new Set());
+  const [confirmDeleteSelectedAudit, setConfirmDeleteSelectedAudit] = useState(false);
   const [confirmClearAllAudit, setConfirmClearAllAudit] = useState(false);
   const [isClearingAudit, setIsClearingAudit] = useState(false);
+
+  const [barcodeSelectMode, setBarcodeSelectMode] = useState(false);
+  const [selectedBarcodeItemIds, setSelectedBarcodeItemIds] = useState<Set<string>>(new Set());
 
   const [notifications, setNotifications] = useState<AppNotification[]>([]);
   const [topLowStockBanner, setTopLowStockBanner] = useState<(AppNotification & { closing?: boolean }) | null>(null);
@@ -570,34 +1168,31 @@ export default function InventoryDashboard() {
   const initialAuditLoadedRef = useRef(false);
   const lowStockChannelRef = useRef<ReturnType<typeof supabase.channel> | null>(null);
 
-  // Maximize & single shared minimize state for Stock by category & Recent audit activity
-  const [isChartMaximized, setIsChartMaximized] = useState(false);
   const [isAuditMaximized, setIsAuditMaximized] = useState(false);
   const [isSectionMinimized, setIsSectionMinimized] = useState(false);
 
-  // Save button checkmark state
   const [isSavingItem, setIsSavingItem] = useState(false);
   const [saveSuccess, setSaveSuccess] = useState(false);
 
-  // Add category checkmark state
   const [isAddingCategory, setIsAddingCategory] = useState(false);
   const [categoryAddSuccess, setCategoryAddSuccess] = useState(false);
 
-  // Scan success & continuous scan state
   const [scanSuccessBanner, setScanSuccessBanner] = useState<string | null>(null);
   const [continuousScan, setContinuousScan] = useState(true);
   const [scanSoundEnabled, setScanSoundEnabled] = useState(true);
   const [lastScannedSummary, setLastScannedSummary] = useState<string | null>(null);
-  const [manualWedgeSku, setManualWedgeSku] = useState('');
   const [customCardQty, setCustomCardQty] = useState<Record<string, number>>({});
   const [copiedRestockList, setCopiedRestockList] = useState(false);
 
-  // Barcode label customization state: format (compact vs full) & batch copies count
+  const [cameraRestartNonce, setCameraRestartNonce] = useState(0);
+
   const [labelFormat, setLabelFormat] = useState<BarcodeLabelFormat>('compact');
   const [printCopiesByItem, setPrintCopiesByItem] = useState<Record<string, number>>({});
 
   const continuousScanRef = useRef(true);
   const scanSoundEnabledRef = useRef(true);
+  const docModalOpenRef = useRef(false);
+  const batchScanActiveRef = useRef(false);
 
   useEffect(() => {
     continuousScanRef.current = continuousScan;
@@ -607,7 +1202,14 @@ export default function InventoryDashboard() {
     scanSoundEnabledRef.current = scanSoundEnabled;
   }, [scanSoundEnabled]);
 
-  // App Settings state
+  useEffect(() => {
+    docModalOpenRef.current = docModalOpen;
+  }, [docModalOpen]);
+
+  useEffect(() => {
+    batchScanActiveRef.current = batchScanActive;
+  }, [batchScanActive]);
+
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [isSettingsClosing, setIsSettingsClosing] = useState(false);
   const [showLowStockPopUp, setShowLowStockPopUp] = useState(true);
@@ -623,7 +1225,9 @@ export default function InventoryDashboard() {
   const [query, setQuery] = useState('');
   const [statusFilter, setStatusFilter] = useState('ALL');
   const [categoryFilter, setCategoryFilter] = useState('ALL');
-  const [activeTab, setActiveTab] = useState<'inventory' | 'audit'>('inventory');
+  const [activeTab, setActiveTab] = useState<OverviewTab>('inventory');
+  const [inventoryViewMode, setInventoryViewMode] = useState<InventoryViewMode>('grouped');
+  const [collapsedGroups, setCollapsedGroups] = useState<Record<string, boolean>>({});
 
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [isModalClosing, setIsModalClosing] = useState(false);
@@ -681,6 +1285,45 @@ export default function InventoryDashboard() {
 
     window.addEventListener('resize', checkCramped);
     return () => window.removeEventListener('resize', checkCramped);
+  }, [user]);
+
+  const fetchStockDocuments = async () => {
+    const { data, error } = await supabase
+      .from('stock_documents')
+      .select('*')
+      .order('created_at', { ascending: false });
+
+    if (!error && Array.isArray(data)) {
+      setDocuments(data.map(mapStockDocumentRow));
+    }
+  };
+
+  useEffect(() => {
+    if (!user) {
+      setDocuments([]);
+      return;
+    }
+
+    let active = true;
+    void fetchStockDocuments();
+
+    const docChannel = supabase
+      .channel('public:stock_documents')
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'stock_documents' },
+        () => {
+          if (active) {
+            void fetchStockDocuments();
+          }
+        }
+      )
+      .subscribe();
+
+    return () => {
+      active = false;
+      supabase.removeChannel(docChannel);
+    };
   }, [user]);
 
   const closePickerAnimated = (afterClose?: () => void) => {
@@ -749,9 +1392,11 @@ export default function InventoryDashboard() {
     }, 200);
   };
 
-  const openScannerAnimated = () => {
+  const openScannerAnimated = (forBatchDoc = false) => {
     setScanSuccessBanner(null);
-    setManualWedgeSku('');
+    setScannerError(null);
+    setScanFeedback(null);
+    setBatchScanActive(forBatchDoc);
     setIsScannerClosing(false);
     setIsScannerOpen(true);
   };
@@ -762,6 +1407,7 @@ export default function InventoryDashboard() {
     setTimeout(() => {
       setIsScannerOpen(false);
       setIsScannerClosing(false);
+      setBatchScanActive(false);
       setScanSuccessBanner(null);
     }, 200);
   };
@@ -777,6 +1423,437 @@ export default function InventoryDashboard() {
       setSaveSuccess(false);
       setIsSavingItem(false);
     }, 200);
+  };
+
+  const closeDocModalAnimated = () => {
+    if (!docModalOpen || docModalClosing) return;
+    setDocModalClosing(true);
+    setTimeout(() => {
+      setDocModalOpen(false);
+      setDocModalClosing(false);
+      setAddGoodPickerOpen(false);
+      setInlineNewGoodOpen(false);
+      setBatchScanActive(false);
+    }, 200);
+  };
+
+  const getNextDocNumber = (kind: 'INCOMING' | 'OUTGOING') => {
+    const existingCount = documents.filter((d) => d.kind === kind).length;
+    return `No.${existingCount + 1}`;
+  };
+
+  const openNewDocumentModal = (kind: 'INCOMING' | 'OUTGOING') => {
+    setEditingDocId(null);
+    setDocKind(kind);
+    setDocNo(getNextDocNumber(kind));
+    setDocPartyName('Select');
+    setDocCustomParty('');
+    setDocDateTime(formatCurrentDocDateTime());
+    setDocDescription('');
+    setDocGoods([]);
+    setDocGoodsSearch('');
+    setDocInfoExpanded(true);
+    setGoodsInfoExpanded(true);
+    setAddGoodPickerOpen(false);
+    setAddGoodCatalogQuery('');
+    setInlineNewGoodOpen(false);
+    setInlineNewGood({
+      name: '',
+      sku: '',
+      category: categories[0]?.name || 'Shirts',
+      size: 'M',
+      qty: '1',
+      colors: [],
+    });
+    setDocModalClosing(false);
+    setDocModalOpen(true);
+  };
+
+  const openEditDocumentModal = (doc: StockDocument) => {
+    setEditingDocId(doc.id);
+    setDocKind(doc.kind);
+    setDocNo(doc.docNo);
+    const partyList = doc.kind === 'INCOMING' ? DEFAULT_SUPPLIERS : DEFAULT_CUSTOMERS;
+    if (partyList.includes(doc.partyName)) {
+      setDocPartyName(doc.partyName);
+      setDocCustomParty('');
+    } else {
+      setDocPartyName('Custom');
+      setDocCustomParty(doc.partyName);
+    }
+    setDocDateTime(doc.dateTime);
+    setDocDescription(doc.description);
+    setDocGoods(doc.goods.map((g) => ({ ...g })));
+    setDocGoodsSearch('');
+    setDocInfoExpanded(true);
+    setGoodsInfoExpanded(true);
+    setAddGoodPickerOpen(false);
+    setInlineNewGoodOpen(false);
+    setDocMenuOpenId(null);
+    setDocModalClosing(false);
+    setDocModalOpen(true);
+  };
+
+  const resolveDocPartyLabel = () => {
+    if (docPartyName === 'Custom') return docCustomParty.trim() || 'Custom';
+    if (docPartyName === 'Select' && docCustomParty.trim()) return docCustomParty.trim();
+    return docPartyName;
+  };
+
+  const addCatalogItemToDocument = (catalogItem: InventoryItem, qtyToAdd = 1) => {
+    const safeQty = Math.max(1, qtyToAdd);
+    setDocGoods((prev) => {
+      const idx = prev.findIndex(
+        (line) =>
+          (line.itemId && line.itemId === catalogItem.id) ||
+          (catalogItem.sku && line.sku.trim().toLowerCase() === catalogItem.sku.trim().toLowerCase())
+      );
+      if (idx >= 0) {
+        const next = [...prev];
+        next[idx] = { ...next[idx], qty: next[idx].qty + safeQty };
+        return next;
+      }
+      return [
+        ...prev,
+        {
+          id: `line-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          itemId: catalogItem.id,
+          name: catalogItem.name,
+          sku: catalogItem.sku,
+          category: catalogItem.category,
+          size: catalogItem.size,
+          colors: catalogItem.colors || [],
+          qty: safeQty,
+        },
+      ];
+    });
+  };
+
+  const addInlineNewItemToDocument = () => {
+    const cleanName = inlineNewGood.name.trim();
+    if (!cleanName) return;
+    const safeQty = Math.max(1, parseInt(inlineNewGood.qty, 10) || 1);
+    const cleanCat = inlineNewGood.category || categories[0]?.name || 'General';
+    const cleanSku = inlineNewGood.sku.trim() || buildSkuForCategory(cleanCat);
+
+    setDocGoods((prev) => [
+      ...prev,
+      {
+        id: `line-new-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        name: cleanName,
+        sku: cleanSku,
+        category: cleanCat,
+        size: inlineNewGood.size.trim() || 'M',
+        colors: inlineNewGood.colors,
+        qty: safeQty,
+        isNewCatalogItem: true,
+      },
+    ]);
+
+    setInlineNewGood({
+      name: '',
+      sku: '',
+      category: cleanCat,
+      size: 'M',
+      qty: '1',
+      colors: [],
+    });
+    setInlineNewGoodOpen(false);
+    setAddGoodPickerOpen(false);
+  };
+
+  const updateDocLineQty = (lineId: string, nextQty: number) => {
+    const clamped = Math.max(1, Number.isNaN(nextQty) ? 1 : nextQty);
+    setDocGoods((prev) =>
+      prev.map((line) => (line.id === lineId ? { ...line, qty: clamped } : line))
+    );
+  };
+
+  const removeDocLine = (lineId: string) => {
+    setDocGoods((prev) => prev.filter((line) => line.id !== lineId));
+  };
+
+  const saveDocumentAsPending = async () => {
+    if (docGoods.length === 0) {
+      pushNotification('Missing Items', 'Add at least one item before saving.', 'info');
+      return;
+    }
+
+    const partyLabel = resolveDocPartyLabel();
+    const cleanDocNo = docNo.trim() || getNextDocNumber(docKind);
+    const cleanDateTime = docDateTime.trim() || formatCurrentDocDateTime();
+    const cleanDescription = docDescription.trim();
+    const prevDocs = documents;
+
+    if (editingDocId) {
+      const updatedDoc: StockDocument = {
+        ...(prevDocs.find((d) => d.id === editingDocId) || {
+          id: editingDocId,
+          kind: docKind,
+          status: 'PENDING' as const,
+          createdAt: new Date().toISOString(),
+        }),
+        docNo: cleanDocNo,
+        partyName: partyLabel,
+        dateTime: cleanDateTime,
+        description: cleanDescription,
+        goods: docGoods,
+      };
+
+      setDocuments((prev) => prev.map((doc) => (doc.id === editingDocId ? updatedDoc : doc)));
+
+      const { error } = await supabase
+        .from('stock_documents')
+        .update({
+          doc_no: cleanDocNo,
+          party_name: partyLabel,
+          date_time: cleanDateTime,
+          description: cleanDescription,
+          goods: docGoods,
+        })
+        .eq('id', editingDocId);
+
+      if (error) {
+        setDocuments(prevDocs);
+        pushNotification('Save Failed', error.message, 'info');
+        return;
+      }
+
+      pushNotification(
+        docKind === 'INCOMING' ? 'Procurement Updated' : 'Outgoing Updated',
+        `${cleanDocNo} (${docGoods.length} line(s)) saved for all staff.`,
+        'info'
+      );
+    } else {
+      const nowIso = new Date().toISOString();
+      const newDoc: StockDocument = {
+        id: `doc-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        kind: docKind,
+        docNo: cleanDocNo,
+        partyName: partyLabel,
+        dateTime: cleanDateTime,
+        description: cleanDescription,
+        goods: docGoods,
+        status: 'PENDING',
+        createdAt: nowIso,
+      };
+
+      setDocuments((prev) => [newDoc, ...prev]);
+
+      const { error } = await supabase.from('stock_documents').insert([
+        {
+          id: newDoc.id,
+          created_by: user?.id ?? null,
+          kind: newDoc.kind,
+          doc_no: newDoc.docNo,
+          party_name: newDoc.partyName,
+          date_time: newDoc.dateTime,
+          description: newDoc.description,
+          goods: newDoc.goods,
+          status: newDoc.status,
+          created_at: newDoc.createdAt,
+        },
+      ]);
+
+      if (error) {
+        setDocuments(prevDocs);
+        pushNotification('Save Failed', error.message, 'info');
+        return;
+      }
+
+      pushNotification(
+        docKind === 'INCOMING' ? 'Procurement Saved' : 'Outgoing Saved',
+        docKind === 'INCOMING'
+          ? `${newDoc.docNo} saved; stock adds on ✓.`
+          : `${newDoc.docNo} saved; stock deducts on ✓.`,
+        'info'
+      );
+    }
+
+    setActiveTab(docKind === 'INCOMING' ? 'incoming' : 'outgoing');
+    closeDocModalAnimated();
+  };
+
+  const commitDocumentToInventory = async (docId: string) => {
+    const targetDoc = documents.find((d) => d.id === docId);
+    if (!targetDoc || targetDoc.status === 'COMPLETED') return;
+
+    setDocMenuOpenId(null);
+
+    const isIncoming = targetDoc.kind === 'INCOMING';
+    const currentItems = [...(itemsRef.current.length > 0 ? itemsRef.current : items)];
+    const changedSummaries: string[] = [];
+
+    for (const line of targetDoc.goods) {
+      const matchedIdx = currentItems.findIndex(
+        (inv) =>
+          (line.itemId && inv.id === line.itemId) ||
+          (line.sku && inv.sku.trim().toLowerCase() === line.sku.trim().toLowerCase()) ||
+          inv.name.trim().toLowerCase() === line.name.trim().toLowerCase()
+      );
+
+      if (matchedIdx >= 0) {
+        const inv = currentItems[matchedIdx];
+        const prevStock = inv.stock;
+        const delta = isIncoming ? line.qty : -line.qty;
+        const nextStock = Math.max(0, prevStock + delta);
+        const nextStatus = computeItemStatus(nextStock, inv.min);
+        const dbStatus = nextStatus === 'OUT OF STOCK' ? 'LOW' : nextStatus;
+
+        currentItems[matchedIdx] = {
+          ...inv,
+          stock: nextStock,
+          status: nextStatus,
+        };
+        triggerStockPulse(inv.id);
+
+        void supabase
+          .from('items')
+          .update({ stock: nextStock, status: dbStatus })
+          .eq('id', inv.id);
+
+        const noteParts = [
+          targetDoc.docNo,
+          targetDoc.partyName && targetDoc.partyName !== 'Select' ? targetDoc.partyName : '',
+          targetDoc.description,
+        ]
+          .filter(Boolean)
+          .join(' • ');
+
+        void logAudit(
+          isIncoming ? 'PROCUREMENT' : 'OUTGOING',
+          inv.name,
+          `${isIncoming ? `+${line.qty}` : `-${line.qty}`} units • ${
+            isIncoming ? 'Procurement arrived & added' : 'Customer order deducted'
+          } (${prevStock} → ${nextStock} stock)${noteParts ? ` • ${noteParts}` : ''} by ${actorName}`,
+          isIncoming ? 'INCOMING' : 'OUTGOING',
+          line.qty,
+          {
+            sku: inv.sku,
+            size: inv.size,
+            colors: inv.colors,
+            previousStock: prevStock,
+            newStock: nextStock,
+            note: noteParts || (isIncoming ? 'Procurement arrival' : 'Customer order'),
+            docNo: targetDoc.docNo,
+            partyName: targetDoc.partyName,
+          }
+        );
+
+        changedSummaries.push(
+          `${inv.name} (${isIncoming ? `+${line.qty}` : `-${line.qty}`}: ${prevStock}→${nextStock})`
+        );
+
+        if (nextStatus === 'OUT OF STOCK' || nextStatus === 'LOW') {
+          seenLowStockKeysRef.current.add(`${inv.id}::${nextStock}::${inv.min}`);
+          void notifyAllUsersLowStock(inv.name, inv.sku, nextStock, inv.min);
+        }
+      } else {
+        const createdStock = isIncoming ? line.qty : 0;
+        const createdStatus = computeItemStatus(createdStock, 5);
+        const dbStatus = createdStatus === 'OUT OF STOCK' ? 'LOW' : createdStatus;
+        const tempId = `temp-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+        const createdItem: InventoryItem = {
+          id: tempId,
+          name: line.name,
+          sku: line.sku,
+          category: line.category || categories[0]?.name || 'General',
+          size: line.size || 'M',
+          stock: createdStock,
+          min: 5,
+          status: createdStatus,
+          colors: line.colors || [],
+        };
+        currentItems.unshift(createdItem);
+
+        void supabase
+          .from('items')
+          .insert([
+            {
+              name: createdItem.name,
+              sku: createdItem.sku,
+              category: createdItem.category,
+              size: createdItem.size,
+              stock: createdItem.stock,
+              min: createdItem.min,
+              status: dbStatus,
+              colors: createdItem.colors,
+            },
+          ])
+          .select('id')
+          .single()
+          .then(({ data }) => {
+            if (data?.id) {
+              const realId = String(data.id);
+              setItems((prev) =>
+                prev.map((entry) => (entry.id === tempId ? { ...entry, id: realId } : entry))
+              );
+            }
+          });
+
+        void logAudit(
+          isIncoming ? 'PROCUREMENT' : 'OUTGOING',
+          createdItem.name,
+          `${isIncoming ? `+${line.qty}` : `-${line.qty}`} units • ${
+            isIncoming ? 'New item added to inventory on arrival' : 'Customer order item logged'
+          } (0 → ${createdStock} stock) • ${targetDoc.docNo} by ${actorName}`,
+          isIncoming ? 'INCOMING' : 'OUTGOING',
+          line.qty,
+          {
+            sku: createdItem.sku,
+            size: createdItem.size,
+            colors: createdItem.colors,
+            previousStock: 0,
+            newStock: createdStock,
+            note: targetDoc.description || targetDoc.docNo,
+            docNo: targetDoc.docNo,
+            partyName: targetDoc.partyName,
+          }
+        );
+        changedSummaries.push(`${createdItem.name} (+${line.qty}: 0→${createdStock})`);
+      }
+    }
+
+    itemsRef.current = currentItems;
+    setItems(currentItems);
+
+    const completedTime = formatCurrentDocDateTime();
+    setDocuments((prev) =>
+      prev.map((d) =>
+        d.id === docId ? { ...d, status: 'COMPLETED', completedAt: completedTime } : d
+      )
+    );
+
+    const { error: docUpdateError } = await supabase
+      .from('stock_documents')
+      .update({ status: 'COMPLETED', completed_at: completedTime })
+      .eq('id', docId);
+
+    if (docUpdateError) {
+      pushNotification('Status Sync Warning', docUpdateError.message, 'info');
+    }
+
+    if (scanSoundEnabledRef.current) {
+      playScanFeedbackChime(true, false);
+    }
+
+    pushNotification(
+      isIncoming ? 'Procurement Added' : 'Outgoing Deducted',
+      `${targetDoc.docNo}: ${changedSummaries.join(', ') || 'Stock updated'}`,
+      'stock_update'
+    );
+  };
+
+  const deleteStockDocument = async (docId: string) => {
+    setDocMenuOpenId(null);
+    const prevDocs = documents;
+    setDocuments((prev) => prev.filter((d) => d.id !== docId));
+
+    const { error } = await supabase.from('stock_documents').delete().eq('id', docId);
+    if (error) {
+      setDocuments(prevDocs);
+      pushNotification('Delete Failed', error.message, 'info');
+    }
   };
 
   const actorName = useMemo(() => {
@@ -856,9 +1933,12 @@ export default function InventoryDashboard() {
     minCount: number
   ) => {
     const alertKey = `${itemName}::${stockCount}::${minCount}`;
-    const message = `${itemName} (${sku || 'No SKU'}) is at ${stockCount} stock (Min: ${minCount}).`;
+    const isOut = stockCount <= 0;
+    const message = isOut
+      ? `${itemName} (${sku || 'No SKU'}) is OUT OF STOCK (0/${minCount}).`
+      : `${itemName} (${sku || 'No SKU'}) is low (${stockCount}/${minCount}).`;
 
-    pushNotification('Low Stock Alert', message, 'low_stock');
+    pushNotification(isOut ? 'Out of Stock Alert' : 'Low Stock Alert', message, 'low_stock');
 
     if (lowStockChannelRef.current) {
       await lowStockChannelRef.current.send({
@@ -866,7 +1946,7 @@ export default function InventoryDashboard() {
         event: 'low_stock_alert',
         payload: {
           alertKey,
-          title: 'Low Stock Alert',
+          title: isOut ? 'Out of Stock Alert' : 'Low Stock Alert',
           message,
           actor: actorNameRef.current,
         },
@@ -895,10 +1975,10 @@ export default function InventoryDashboard() {
       if (e.key === 'Escape') {
         if (isPickerOpen) closePickerAnimated();
         else if (isModalOpen) closeModalAnimated();
+        else if (docModalOpen) closeDocModalAnimated();
         else if (isScannerOpen) closeScannerAnimated();
         else if (isSettingsOpen) closeSettingsAnimated();
         else if (isNotifOpen) closeNotifAnimated();
-        else if (isChartMaximized) setIsChartMaximized(false);
         else if (isAuditMaximized) setIsAuditMaximized(false);
       } else if (e.key === '/' && !isTypingField && user) {
         e.preventDefault();
@@ -911,10 +1991,10 @@ export default function InventoryDashboard() {
   }, [
     isPickerOpen,
     isModalOpen,
+    docModalOpen,
     isScannerOpen,
     isSettingsOpen,
     isNotifOpen,
-    isChartMaximized,
     isAuditMaximized,
     user,
   ]);
@@ -963,41 +2043,78 @@ export default function InventoryDashboard() {
   }, []);
 
   const t = {
-    bg: darkMode ? 'bg-black' : 'bg-white',
-    text: darkMode ? 'text-white' : 'text-black',
-    textMuted: darkMode ? 'text-zinc-400' : 'text-zinc-500',
-    textMuted2: darkMode ? 'text-zinc-500' : 'text-zinc-400',
-    border: darkMode ? 'border-zinc-800' : 'border-zinc-300',
-    cardBg: darkMode ? 'bg-zinc-950/80' : 'bg-zinc-50',
-    cardBg2: darkMode ? 'bg-zinc-950' : 'bg-white',
-    cardBg3: darkMode ? 'bg-black/40' : 'bg-zinc-100/60',
-    cardBgHover: darkMode ? 'bg-zinc-900/70' : 'bg-zinc-100',
-    inputBg: darkMode ? 'bg-black/40' : 'bg-zinc-100',
-    optionBg: darkMode ? 'bg-zinc-900 text-white' : 'bg-white text-black',
+    text: darkMode ? 'text-white' : 'text-zinc-950',
+    textMuted: darkMode ? 'text-zinc-200/85' : 'text-zinc-700',
+    textMuted2: darkMode ? 'text-zinc-300/75' : 'text-zinc-600',
+    dangerText: darkMode ? 'text-red-400' : 'text-red-700',
+    successText: darkMode ? 'text-emerald-400' : 'text-emerald-700',
+    warnText: darkMode ? 'text-amber-400' : 'text-amber-800',
+    border: darkMode ? 'border-white/20' : 'border-black/20',
+    cardBg: darkMode
+      ? 'bg-zinc-900/40 backdrop-blur-2xl saturate-150 ring-1 ring-inset ring-white/10'
+      : 'bg-white/70 backdrop-blur-2xl saturate-150 ring-1 ring-inset ring-white/70',
+    cardBg2: darkMode
+      ? 'bg-zinc-900/40 backdrop-blur-2xl saturate-150 ring-1 ring-inset ring-white/10'
+      : 'bg-white/75 backdrop-blur-2xl saturate-150 ring-1 ring-inset ring-white/70',
+    cardBg3: darkMode
+      ? 'bg-white/[0.06] backdrop-blur-xl ring-1 ring-inset ring-white/10'
+      : 'bg-white/60 backdrop-blur-xl ring-1 ring-inset ring-black/5',
+    cardBgHover: darkMode
+      ? 'bg-zinc-900/40 backdrop-blur-xl hover:bg-zinc-800/55 ring-1 ring-inset ring-white/10'
+      : 'bg-white/70 backdrop-blur-xl hover:bg-white/95 ring-1 ring-inset ring-black/5',
+    inputBg: darkMode
+      ? 'bg-black/25 backdrop-blur-xl ring-1 ring-inset ring-white/10'
+      : 'bg-white/85 backdrop-blur-xl ring-1 ring-inset ring-black/10',
     btnPrimary: darkMode
-      ? 'tpd-click-press bg-white text-black border-zinc-700 hover:bg-zinc-100 hover:-translate-y-0.5 hover:shadow-lg'
-      : 'tpd-click-press bg-black text-white border-zinc-400 hover:bg-zinc-800 hover:-translate-y-0.5 hover:shadow-lg',
+      ? 'tpd-click-press bg-white text-black border-white/30 hover:bg-zinc-100 hover:-translate-y-0.5 hover:shadow-lg'
+      : 'tpd-click-press bg-zinc-900 text-white border-zinc-900 hover:bg-zinc-800 hover:-translate-y-0.5 hover:shadow-lg',
     btnSecondary: darkMode
-      ? 'tpd-click-press bg-zinc-900 text-white border-zinc-700 hover:bg-zinc-800 hover:-translate-y-0.5 hover:shadow-md'
-      : 'tpd-click-press bg-zinc-200 text-black border-zinc-300 hover:bg-zinc-300 hover:-translate-y-0.5 hover:shadow-md',
-    tabActive: darkMode ? 'tpd-click-press bg-white text-black shadow-sm' : 'tpd-click-press bg-black text-white shadow-sm',
+      ? 'tpd-click-press bg-white/12 text-white border-white/20 backdrop-blur-xl ring-1 ring-inset ring-white/10 hover:bg-white/20 hover:-translate-y-0.5 hover:shadow-md'
+      : 'tpd-click-press bg-white/80 text-zinc-950 border-black/20 hover:bg-white hover:-translate-y-0.5 hover:shadow-md',
+    btnDangerSubtle: darkMode
+      ? 'tpd-click-press border-red-400/40 bg-red-600/25 text-red-200 hover:bg-red-600/35'
+      : 'tpd-click-press border-red-300 bg-red-100 text-red-800 hover:bg-red-200',
+    tabActive: darkMode
+      ? 'tpd-click-press bg-white text-black shadow-sm'
+      : 'tpd-click-press bg-zinc-900 text-white shadow-sm',
     tabInactive: darkMode
-      ? 'tpd-click-press bg-zinc-900 text-zinc-300 hover:bg-zinc-800 hover:text-white'
-      : 'tpd-click-press bg-zinc-200 text-zinc-600 hover:bg-zinc-300 hover:text-black',
-    lowBg: darkMode ? 'bg-red-600/20 text-red-400 border-red-900/50' : 'bg-red-100 text-red-700 border-red-300',
-    okBg: darkMode ? 'bg-emerald-600/20 text-emerald-400' : 'bg-emerald-100 text-emerald-700',
-    progressBg: darkMode ? 'bg-zinc-800' : 'bg-zinc-300',
-    progressFill: darkMode ? 'bg-white' : 'bg-black',
-    chartStroke: darkMode ? '#27272a' : '#d4d4d8',
-    chartAxis: darkMode ? '#a1a1aa' : '#52525b',
-    overlay: darkMode ? 'bg-black/75 backdrop-blur-xs' : 'bg-white/75 backdrop-blur-xs',
-    modalBg: darkMode ? 'bg-zinc-950 border-zinc-800' : 'bg-white border-zinc-300',
-    badgeBg: darkMode ? 'border-zinc-700 text-zinc-300' : 'border-zinc-400 text-zinc-600',
-    needsRestockBg: darkMode ? 'bg-red-950/40' : 'bg-red-50',
-    needsRestockBorder: darkMode ? 'border-red-900/50' : 'border-red-300',
+      ? 'tpd-click-press bg-white/10 text-zinc-200 hover:bg-white/20 hover:text-white'
+      : 'tpd-click-press bg-white/75 text-zinc-800 border border-black/15 hover:bg-white hover:text-zinc-950',
+    outBg: darkMode
+      ? 'bg-zinc-900/70 text-zinc-200 border-zinc-400/40 backdrop-blur-md'
+      : 'bg-zinc-900 text-white border-zinc-900',
+    lowBg: darkMode
+      ? 'bg-red-500/20 text-red-200 border-red-400/35 backdrop-blur-md'
+      : 'bg-red-100 text-red-900 border-red-300',
+    okBg: darkMode
+      ? 'bg-emerald-500/20 text-emerald-200 border-emerald-400/30 backdrop-blur-md'
+      : 'bg-emerald-100 text-emerald-900 border-emerald-300',
+    incomingBadge: darkMode
+      ? 'bg-emerald-500/20 text-emerald-200 border-emerald-400/35'
+      : 'bg-emerald-100 text-emerald-900 border-emerald-300',
+    outgoingBadge: darkMode
+      ? 'bg-amber-500/20 text-amber-200 border-amber-400/35'
+      : 'bg-amber-100 text-amber-950 border-amber-300',
+    overlay: darkMode ? 'bg-black/45 backdrop-blur-md' : 'bg-zinc-900/25 backdrop-blur-md',
+    modalBg: darkMode
+      ? 'bg-zinc-950/90 border-white/20 backdrop-blur-2xl saturate-150 ring-1 ring-inset ring-white/10'
+      : 'bg-white/95 border-black/20 backdrop-blur-2xl saturate-150 ring-1 ring-inset ring-black/5',
+    badgeBg: darkMode
+      ? 'border-white/15 bg-white/[0.08] text-zinc-200 backdrop-blur-md'
+      : 'border-black/15 bg-white/80 text-zinc-800',
+    needsRestockBg: darkMode
+      ? 'bg-red-950/35 backdrop-blur-xl ring-1 ring-inset ring-red-400/15'
+      : 'bg-red-50/90 ring-1 ring-inset ring-red-200',
+    needsRestockBorder: darkMode ? 'border-red-400/35' : 'border-red-300',
   };
 
-  const iconClass = darkMode ? 'text-zinc-500' : 'text-zinc-400';
+  const getStatusBadgeStyle = (status: ItemStatus) => {
+    if (status === 'OUT OF STOCK') return t.outBg;
+    if (status === 'LOW') return t.lowBg;
+    return t.okBg;
+  };
+
+  const iconClass = darkMode ? 'text-zinc-300' : 'text-zinc-700';
 
   const handleManualAuth = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -1131,6 +2248,25 @@ export default function InventoryDashboard() {
     }));
   };
 
+  const toggleBarcodeSelection = (itemId: string) => {
+    setSelectedBarcodeItemIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(itemId)) {
+        next.delete(itemId);
+      } else {
+        next.add(itemId);
+      }
+      return next;
+    });
+  };
+
+  const toggleGroupCollapse = (categoryName: string) => {
+    setCollapsedGroups((current) => ({
+      ...current,
+      [categoryName]: !current[categoryName],
+    }));
+  };
+
   const getItemPrintCopies = (itemId: string): number => {
     const raw = printCopiesByItem[itemId];
     return Math.max(1, Math.min(100, Number(raw) || 1));
@@ -1193,7 +2329,7 @@ export default function InventoryDashboard() {
           ctx.font = 'bold 10px Arial, sans-serif';
           ctx.textAlign = 'center';
           ctx.fillText(
-            `${(item.category || 'ITEM').toUpperCase()} • SIZE ${item.size || '-'}`,
+            `${(item.category || 'ITEM').toUpperCase()} • SIZE/TYPE ${item.size || '-'}`,
             canvas.width / 2,
             yCursor
           );
@@ -1249,156 +2385,58 @@ export default function InventoryDashboard() {
 
   const printBarcodeLabel = (item: InventoryItem, copiesOverride?: number) => {
     if (!item.sku) return;
-    const container = document.getElementById(`barcode-label-${item.id}`);
-    if (!container) return;
-
     const copies = Math.max(1, Math.min(100, copiesOverride ?? getItemPrintCopies(item.id)));
-    const itemSizeLabel = formatBarcodeItemSizeLabel(item.name, item.size);
-    const colors = item.colors || [];
-    const isFull = labelFormat === 'full';
+    const cardsHtml = buildSingleBarcodeCardHtml(item, copies, labelFormat);
+    if (!cardsHtml) return;
+    openPrintWindowWithCards(`THE PRINTING DEPOT - ${item.sku} (${copies}x)`, cardsHtml);
+  };
 
-    const colorCirclesHtml = colors
-      .map(
-        (color) =>
-          `<span class="color-dot" title="${escapeHtml(color)}" style="background:${escapeHtml(
-            getColorFill(color)
-          )};"></span>`
-      )
-      .join('');
+  const printSelectedBarcodes = () => {
+    const chosenItems = items.filter(
+      (entry) => selectedBarcodeItemIds.has(entry.id) && Boolean(entry.sku)
+    );
+    if (chosenItems.length === 0) return;
 
-    const singleCardHtml = `
-      <div class="label-card ${isFull ? 'label-full' : 'label-compact'}">
-        ${
-          isFull
-            ? `<div class="top-meta"><span>${escapeHtml(item.category || 'Item')}</span> &bull; <span>Size: ${escapeHtml(
-                item.size || '-'
-              )}</span></div>`
-            : ''
-        }
-        <div class="item-row">
-          <span class="item-mark">${escapeHtml(itemSizeLabel)}</span>
-          ${colorCirclesHtml ? `<span class="color-dots">${colorCirclesHtml}</span>` : ''}
-        </div>
-        <div class="barcode-box">${container.innerHTML}</div>
-        ${
-          isFull && colors.length > 0
-            ? `<div class="color-names">Colors: ${escapeHtml(colors.join(', '))}</div>`
-            : ''
-        }
-      </div>
-    `;
+    setExpandedBarcodes((prev) => {
+      const next = { ...prev };
+      chosenItems.forEach((entry) => {
+        next[entry.id] = true;
+      });
+      return next;
+    });
 
-    const printWin = window.open('', '_blank', 'width=520,height=420');
-    if (!printWin) return;
-
-    printWin.document.write(`
-      <html>
-        <head>
-          <title>THE PRINTING DEPOT - ${escapeHtml(item.sku)} (${copies}x)</title>
-          <style>
-            body {
-              font-family: Arial, sans-serif;
-              margin: 0;
-              padding: 12px;
-              background: #ffffff;
-              color: #000000;
-            }
-            .sheet {
-              display: flex;
-              flex-wrap: wrap;
-              gap: 10px;
-              align-items: flex-start;
-              justify-content: flex-start;
-            }
-            .label-card {
-              border: 1px solid #d4d4d8;
-              border-radius: 8px;
-              padding: 8px 10px;
-              background: #ffffff;
-              display: inline-flex;
-              flex-direction: column;
-              align-items: center;
-              box-sizing: border-box;
-              break-inside: avoid;
-            }
-            .label-compact {
-              min-width: 170px;
-            }
-            .label-full {
-              min-width: 230px;
-              padding: 10px 12px;
-            }
-            .top-meta {
-              font-size: 10px;
-              color: #3f3f46;
-              margin-bottom: 4px;
-              text-align: center;
-            }
-            .item-row {
-              display: inline-flex;
-              align-items: center;
-              justify-content: center;
-              gap: 6px;
-              margin-bottom: 4px;
-            }
-            .item-mark {
-              font-size: 12px;
-              font-weight: 800;
-              letter-spacing: 0.06em;
-              color: #000000;
-            }
-            .color-dots {
-              display: inline-flex;
-              align-items: center;
-              gap: 4px;
-            }
-            .color-dot {
-              display: inline-block;
-              width: 11px;
-              height: 11px;
-              border-radius: 9999px;
-              border: 1px solid #27272a;
-            }
-            .barcode-box {
-              display: flex;
-              justify-content: center;
-            }
-            .color-names {
-              margin-top: 4px;
-              font-size: 10px;
-              color: #27272a;
-              text-align: center;
-            }
-          </style>
-        </head>
-        <body>
-          <div class="sheet">${singleCardHtml.repeat(copies)}</div>
-          <script>
-            window.onload = function () {
-              window.print();
-              window.close();
-            };
-          </script>
-        </body>
-      </html>
-    `);
-    printWin.document.close();
+    setTimeout(() => {
+      const allCardsHtml = chosenItems
+        .map((entry) => buildSingleBarcodeCardHtml(entry, getItemPrintCopies(entry.id), labelFormat))
+        .filter(Boolean)
+        .join('');
+      if (!allCardsHtml) return;
+      openPrintWindowWithCards(
+        `THE PRINTING DEPOT - Batch Barcodes (${chosenItems.length} items)`,
+        allCardsHtml
+      );
+    }, 80);
   };
 
   const fetchData = async () => {
     const { data: itemData } = await supabase.from('items').select('*').order('created_at', { ascending: false });
     if (itemData) {
-      const mapped = itemData.map((row: any) => ({
-        id: String(row.id),
-        name: row.name || '',
-        sku: row.sku || '',
-        category: row.category || '',
-        size: row.size || 'M',
-        stock: Number(row.stock ?? 0),
-        min: Number(row.min ?? 5),
-        status: row.status || (Number(row.stock ?? 0) <= Number(row.min ?? 5) ? 'LOW' : 'OK'),
-        colors: Array.isArray(row.colors) ? row.colors : [],
-      }));
+      const mapped: InventoryItem[] = itemData.map((row: any) => {
+        const stockNum = Number(row.stock ?? 0);
+        const minNum = Number(row.min ?? 5);
+        const computedStatus = computeItemStatus(stockNum, minNum);
+        return {
+          id: String(row.id),
+          name: row.name || '',
+          sku: row.sku || '',
+          category: row.category || '',
+          size: row.size || 'M',
+          stock: stockNum,
+          min: minNum,
+          status: computedStatus,
+          colors: Array.isArray(row.colors) ? row.colors : [],
+        };
+      });
       itemsRef.current = mapped;
       setItems(mapped);
     }
@@ -1410,14 +2448,20 @@ export default function InventoryDashboard() {
 
     const { data: auditData } = await supabase.from('audit_logs').select('*').order('created_at', { ascending: false });
     if (auditData) {
-      const mappedAudit: AuditEntry[] = auditData.map((row: any) => ({
-        id: String(row.id),
-        action: row.action,
-        item: row.item,
-        detail: row.detail,
-        user: row.user,
-        time: row.time,
-      }));
+      const mappedAudit: AuditEntry[] = auditData.map((row: any) => {
+        const parsed = parseMovementMeta(row.detail || '', row.action || '');
+        return {
+          id: String(row.id),
+          action: row.action,
+          item: row.item,
+          detail: parsed.cleanDetail,
+          user: row.user,
+          time: row.time,
+          direction: parsed.direction,
+          qtyDelta: parsed.qtyDelta,
+          meta: parsed.meta,
+        };
+      });
       setAuditLog(mappedAudit);
 
       if (!initialAuditLoadedRef.current) {
@@ -1442,7 +2486,16 @@ export default function InventoryDashboard() {
 
   useEffect(() => {
     if (!user) return;
-    fetchData();
+
+    let fetchDebounceRef: ReturnType<typeof setTimeout> | null = null;
+    const scheduleFetchData = () => {
+      if (fetchDebounceRef) clearTimeout(fetchDebounceRef);
+      fetchDebounceRef = setTimeout(() => {
+        void fetchData();
+      }, 180);
+    };
+
+    void fetchData();
 
     const itemChannel = supabase
       .channel('public:items')
@@ -1451,20 +2504,20 @@ export default function InventoryDashboard() {
         if (nextRow) {
           const stockNum = Number(nextRow.stock ?? 0);
           const minNum = Number(nextRow.min ?? 5);
-          const isLow = nextRow.status === 'LOW' || stockNum <= minNum;
-          if (isLow) {
+          const statusNow = computeItemStatus(stockNum, minNum);
+          if (statusNow === 'OUT OF STOCK' || statusNow === 'LOW') {
             const alertKey = `${nextRow.id ?? nextRow.name}::${stockNum}::${minNum}`;
             if (!seenLowStockKeysRef.current.has(alertKey)) {
               seenLowStockKeysRef.current.add(alertKey);
               pushNotification(
-                'Low Stock Alert',
+                statusNow === 'OUT OF STOCK' ? 'Out of Stock Alert' : 'Low Stock Alert',
                 `${nextRow.name || 'Item'} (${nextRow.sku || 'No SKU'}) is at ${stockNum} stock (Min: ${minNum}).`,
                 'low_stock'
               );
             }
           }
         }
-        fetchData();
+        scheduleFetchData();
       })
       .subscribe();
 
@@ -1487,10 +2540,11 @@ export default function InventoryDashboard() {
 
     lowStockChannelRef.current = alertBroadcastChannel;
 
-    const catChannel = supabase.channel('public:categories').on('postgres_changes', { event: '*', schema: 'public', table: 'categories' }, fetchData).subscribe();
-    const auditChannel = supabase.channel('public:audit_logs').on('postgres_changes', { event: '*', schema: 'public', table: 'audit_logs' }, fetchData).subscribe();
+    const catChannel = supabase.channel('public:categories').on('postgres_changes', { event: '*', schema: 'public', table: 'categories' }, scheduleFetchData).subscribe();
+    const auditChannel = supabase.channel('public:audit_logs').on('postgres_changes', { event: '*', schema: 'public', table: 'audit_logs' }, scheduleFetchData).subscribe();
 
     return () => {
+      if (fetchDebounceRef) clearTimeout(fetchDebounceRef);
       lowStockChannelRef.current = null;
       supabase.removeChannel(itemChannel);
       supabase.removeChannel(alertBroadcastChannel);
@@ -1499,7 +2553,14 @@ export default function InventoryDashboard() {
     };
   }, [user]);
 
-  const logAudit = async (action: string, item: string, detail: string) => {
+  const logAudit = async (
+    action: string,
+    item: string,
+    detail: string,
+    direction: 'INCOMING' | 'OUTGOING' | 'OTHER' = 'OTHER',
+    qtyDelta = 0,
+    meta?: MovementMeta
+  ) => {
     const timestamp = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
     const optimisticEntry: AuditEntry = {
       id: `opt-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
@@ -1508,9 +2569,14 @@ export default function InventoryDashboard() {
       detail,
       user: actorName,
       time: timestamp,
+      direction,
+      qtyDelta,
+      meta,
     };
     seenAuditIdsRef.current.add(optimisticEntry.id);
     setAuditLog((prev) => [optimisticEntry, ...prev]);
+
+    const dbDetail = meta ? `${detail} ||META:${JSON.stringify(meta)}` : detail;
 
     const { data, error } = await supabase
       .from('audit_logs')
@@ -1518,7 +2584,7 @@ export default function InventoryDashboard() {
         {
           action,
           item,
-          detail,
+          detail: dbDetail,
           user: actorName,
           time: timestamp,
         },
@@ -1529,26 +2595,39 @@ export default function InventoryDashboard() {
     if (!error && data?.id) {
       const realId = String(data.id);
       seenAuditIdsRef.current.add(realId);
-      setAuditLog((prev) => prev.map((entry) => (entry.id === optimisticEntry.id ? { ...entry, id: realId } : entry)));
+      setAuditLog((prev) =>
+        prev.map((entry) => (entry.id === optimisticEntry.id ? { ...entry, id: realId } : entry))
+      );
     }
   };
 
   const deleteAuditLog = async (auditId: string) => {
     const prevLog = auditLog;
-    setAuditLog((prev) => prev.filter((entry) => entry.id !== auditId));
+    setAuditLog((prev) => {
+      const next = prev.filter((entry) => entry.id !== auditId);
+      if (next.length === 0) {
+        setAuditSelectMode(false);
+        setConfirmDeleteSelectedAudit(false);
+      }
+      return next;
+    });
     setSelectedAuditIds((prev) => {
       const next = new Set(prev);
       next.delete(auditId);
+      if (next.size === 0) setConfirmDeleteSelectedAudit(false);
       return next;
     });
-    const { error } = await supabase.from('audit_logs').delete().eq('id', auditId);
-    if (error) {
-      setAuditLog(prevLog);
-      alert('Error deleting audit log: ' + error.message);
+    if (!auditId.startsWith('opt-')) {
+      const { error } = await supabase.from('audit_logs').delete().eq('id', auditId);
+      if (error) {
+        setAuditLog(prevLog);
+        pushNotification('Delete Failed', error.message, 'info');
+      }
     }
   };
 
   const toggleAuditSelection = (auditId: string) => {
+    setConfirmDeleteSelectedAudit(false);
     setSelectedAuditIds((prev) => {
       const next = new Set(prev);
       if (next.has(auditId)) {
@@ -1561,6 +2640,7 @@ export default function InventoryDashboard() {
   };
 
   const toggleSelectAllAudit = () => {
+    setConfirmDeleteSelectedAudit(false);
     if (selectedAuditIds.size === auditLog.length && auditLog.length > 0) {
       setSelectedAuditIds(new Set());
     } else {
@@ -1576,13 +2656,14 @@ export default function InventoryDashboard() {
 
     setAuditLog((prev) => prev.filter((entry) => !selectedAuditIds.has(entry.id)));
     setSelectedAuditIds(new Set());
+    setConfirmDeleteSelectedAudit(false);
 
     const dbIds = idsToDelete.filter((id) => !id.startsWith('opt-'));
     if (dbIds.length > 0) {
       const { error } = await supabase.from('audit_logs').delete().in('id', dbIds);
       if (error) {
         setAuditLog(prevLog);
-        alert('Error deleting selected audit logs: ' + error.message);
+        pushNotification('Delete Failed', error.message, 'info');
       }
     }
     setIsClearingAudit(false);
@@ -1592,61 +2673,101 @@ export default function InventoryDashboard() {
     if (auditLog.length === 0 || isClearingAudit) return;
     setIsClearingAudit(true);
     const prevLog = auditLog;
+    const realIds = prevLog.map((entry) => entry.id).filter((id) => !id.startsWith('opt-'));
 
     setAuditLog([]);
     setSelectedAuditIds(new Set());
     setAuditSelectMode(false);
+    setConfirmDeleteSelectedAudit(false);
     setConfirmClearAllAudit(false);
 
-    const { error } = await supabase.from('audit_logs').delete().not('id', 'is', null);
-    if (error) {
-      setAuditLog(prevLog);
-      alert('Error clearing audit logs: ' + error.message);
+    if (realIds.length > 0) {
+      const { error } = await supabase.from('audit_logs').delete().in('id', realIds);
+      if (error) {
+        setAuditLog(prevLog);
+        pushNotification('Clear Failed', error.message, 'info');
+      }
     }
     setIsClearingAudit(false);
   };
 
-  const adjustStock = async (itemId: string, delta: number, source: 'button' | 'scan' = 'button') => {
+  const adjustStock = async (
+    itemId: string,
+    delta: number,
+    source: 'button' | 'scan' = 'button',
+    customNote?: string
+  ) => {
     if (!delta) return;
     const currentItems = itemsRef.current.length > 0 ? itemsRef.current : items;
     const item = currentItems.find((entry) => entry.id === itemId);
     if (!item) return;
 
-    const nextStock = Math.max(0, item.stock + delta);
-    const actualDelta = nextStock - item.stock;
-    const nextStatus = nextStock <= item.min ? 'LOW' : 'OK';
+    const previousStock = item.stock;
+    const nextStock = Math.max(0, previousStock + delta);
+    const actualDelta = nextStock - previousStock;
+    const nextStatus = computeItemStatus(nextStock, item.min);
+    const dbStatus = nextStatus === 'OUT OF STOCK' ? 'LOW' : nextStatus;
+    const trimmedNote = (customNote ?? '').trim();
 
     const updatedList = currentItems.map((entry) =>
-      entry.id === itemId ? { ...entry, stock: nextStock, status: nextStatus as 'LOW' | 'OK' } : entry
+      entry.id === itemId ? { ...entry, stock: nextStock, status: nextStatus } : entry
     );
     itemsRef.current = updatedList;
     setItems(updatedList);
     triggerStockPulse(itemId);
 
-    void supabase.from('items').update({ stock: nextStock, status: nextStatus }).eq('id', itemId).then(({ error }) => {
-      if (error) {
-        void fetchData();
-      }
-    });
+    void supabase
+      .from('items')
+      .update({ stock: nextStock, status: dbStatus })
+      .eq('id', itemId)
+      .then(({ error }) => {
+        if (error) {
+          void fetchData();
+        }
+      });
 
-    void logAudit(
-      actualDelta >= 0 ? 'ADD STOCK' : 'REMOVE STOCK',
-      item.name,
-      `${actualDelta >= 0 ? '+' : ''}${actualDelta} units (Now: ${nextStock}) by ${actorName}`
-    );
+    if (actualDelta !== 0) {
+      const isIncoming = actualDelta > 0;
+      const reasonText = isIncoming
+        ? 'Procurement buy / incoming restock'
+        : 'Customer order going out';
+      const noteSegment = trimmedNote ? ` • Ref: ${trimmedNote}` : '';
+      const statusNote =
+        !isIncoming && nextStock === 0
+          ? ' (Now OUT OF STOCK)'
+          : nextStatus === 'LOW'
+            ? ' (Low stock alert)'
+            : '';
 
-    if (nextStatus === 'LOW') {
+      void logAudit(
+        isIncoming ? 'PROCUREMENT' : 'OUTGOING',
+        item.name,
+        `${isIncoming ? `+${actualDelta}` : actualDelta} units • ${reasonText} (${previousStock} → ${nextStock} stock)${statusNote}${noteSegment} by ${actorName}`,
+        isIncoming ? 'INCOMING' : 'OUTGOING',
+        Math.abs(actualDelta),
+        {
+          sku: item.sku,
+          size: item.size,
+          colors: item.colors,
+          previousStock,
+          newStock: nextStock,
+          note: trimmedNote || reasonText,
+        }
+      );
+    }
+
+    if (nextStatus === 'OUT OF STOCK' || nextStatus === 'LOW') {
       seenLowStockKeysRef.current.add(`${item.id}::${nextStock}::${item.min}`);
       void notifyAllUsersLowStock(item.name, item.sku, nextStock, item.min);
     } else if (source === 'scan') {
       pushNotification(
-        actualDelta >= 0 ? 'Scan Added Stock' : 'Scan Deducted Stock',
-        `${item.name}: ${actualDelta >= 0 ? `+${actualDelta}` : actualDelta} unit(s) • Now ${nextStock} in stock.`,
+        actualDelta >= 0 ? 'Procurement Scan' : 'Outgoing Scan',
+        `${item.name}: ${actualDelta >= 0 ? `+${actualDelta}` : actualDelta} (${previousStock} → ${nextStock})`,
         'scan'
       );
     }
 
-    return { item, nextStock, actualDelta };
+    return { item, nextStock, actualDelta, previousStock };
   };
 
   const processScannedCode = async (
@@ -1657,88 +2778,133 @@ export default function InventoryDashboard() {
     const cleaned = rawCode.trim();
     if (!cleaned) return;
 
-    setScannerError(null);
-    setScanFeedback(null);
-    setQuery(cleaned);
-    setStatusFilter('ALL');
-    setCategoryFilter('ALL');
-    setActiveTab('inventory');
-
-    const currentMode = scanModeRef.current;
-    const keepOpen = continuousScanRef.current;
+    const keepOpen = continuousScanRef.current || batchScanActiveRef.current;
     const playChime = scanSoundEnabledRef.current;
     const unlockDelay = keepOpen ? 500 : 850;
+    let shouldUnlockInFinally = keepOpen;
 
-    if (currentMode === 'search') {
-      const match = itemsRef.current.find(
+    try {
+      setScannerError(null);
+      setScanFeedback(null);
+
+      if (docModalOpenRef.current) {
+        const matchedCatalogItem = itemsRef.current.find(
+          (entry) => entry.sku.trim().toLowerCase() === cleaned.toLowerCase()
+        );
+        const qty = Math.max(1, Number(scanQuantityRef.current) || 1);
+
+        if (matchedCatalogItem) {
+          addCatalogItemToDocument(matchedCatalogItem, qty);
+          if (playChime) playScanFeedbackChime(true, keepOpen);
+          const msg = `${matchedCatalogItem.name} (+${qty}) added to ${docNo}`;
+          setScanSuccessBanner(`Scanned ${msg}`);
+          setScanFeedback(`Added ${matchedCatalogItem.name} (${matchedCatalogItem.sku}) x${qty} to goods.`);
+          return;
+        } else {
+          if (playChime) playScanFeedbackChime(false, false);
+          setScanFeedback(`No item found with SKU "${cleaned}".`);
+          return;
+        }
+      }
+
+      setQuery(cleaned);
+      setStatusFilter('ALL');
+      setCategoryFilter('ALL');
+      setActiveTab('inventory');
+
+      const currentMode = scanModeRef.current;
+
+      if (currentMode === 'search') {
+        const match = itemsRef.current.find(
+          (entry) =>
+            entry.sku.trim().toLowerCase() === cleaned.toLowerCase() ||
+            `${entry.name} ${entry.sku}`.toLowerCase().includes(cleaned.toLowerCase())
+        );
+        if (playChime) playScanFeedbackChime(true, keepOpen);
+        const summary = match
+          ? `${match.name} (${match.size || '-'}) • ${match.stock} in stock • ${match.status}`
+          : `Showing matches for "${cleaned}"`;
+        setLastScannedSummary(summary);
+        setScanSuccessBanner(`Found: ${summary}`);
+        setScanFeedback(`Shown in Inventory: ${summary}`);
+        pushNotification('Barcode Scanned', `Found ${summary}.`, 'scan');
+
+        if (!keepOpen) {
+          shouldUnlockInFinally = false;
+          if (stopCameraFn) await stopCameraFn();
+          if (allowCloseModal) {
+            setTimeout(() => closeScannerAnimated(), unlockDelay);
+          }
+        }
+        return;
+      }
+
+      const matchedItem = itemsRef.current.find(
         (entry) => entry.sku.trim().toLowerCase() === cleaned.toLowerCase()
       );
+
+      if (!matchedItem) {
+        if (playChime) playScanFeedbackChime(false, false);
+        setScanFeedback(`No exact SKU match for "${cleaned}".`);
+        pushNotification('SKU Not Found', `No exact SKU match for "${cleaned}".`, 'low_stock');
+
+        if (!keepOpen) {
+          shouldUnlockInFinally = false;
+          if (stopCameraFn) await stopCameraFn();
+          if (allowCloseModal) {
+            setTimeout(() => closeScannerAnimated(), 1100);
+          }
+        }
+        return;
+      }
+
+      const qty = Math.max(1, Number(scanQuantityRef.current) || 1);
+      const delta = currentMode === 'add' ? qty : -qty;
+      const result = await adjustStock(matchedItem.id, delta, 'scan');
+      const prevCount = result?.previousStock ?? matchedItem.stock;
+      const resultingStock = result?.nextStock ?? Math.max(0, matchedItem.stock + delta);
+      const actualDelta = result?.actualDelta ?? delta;
+
       if (playChime) playScanFeedbackChime(true, keepOpen);
-      const summary = match ? `${match.name} (${match.stock} in stock)` : `Filter: "${cleaned}"`;
-      setLastScannedSummary(summary);
-      setScanSuccessBanner(`Scanned "${cleaned}" — ${summary}`);
-      pushNotification('Barcode Scanned', `Filtered inventory by "${cleaned}".`, 'scan');
+      const dirTag = actualDelta >= 0 ? 'ADD' : 'DEDUCT';
+      const label = `${matchedItem.name} [${dirTag} ${actualDelta >= 0 ? `+${actualDelta}` : actualDelta} • ${prevCount} → ${resultingStock}]`;
+      setLastScannedSummary(label);
+      setScanSuccessBanner(`Scanned ${label}`);
+      setScanFeedback(
+        `${matchedItem.name}: ${actualDelta >= 0 ? 'Added' : 'Deducted'} ${Math.abs(actualDelta)} (${prevCount} → ${resultingStock}).`
+      );
 
       if (!keepOpen) {
+        shouldUnlockInFinally = false;
         if (stopCameraFn) await stopCameraFn();
         if (allowCloseModal) {
           setTimeout(() => closeScannerAnimated(), unlockDelay);
         }
-      } else {
+      }
+    } finally {
+      if (shouldUnlockInFinally) {
         setTimeout(() => {
           scanLockedRef.current = false;
         }, unlockDelay);
       }
-      return;
-    }
-
-    const matchedItem = itemsRef.current.find(
-      (entry) => entry.sku.trim().toLowerCase() === cleaned.toLowerCase()
-    );
-
-    if (!matchedItem) {
-      if (playChime) playScanFeedbackChime(false, false);
-      setScanFeedback(`No item found with SKU "${cleaned}". Search filter applied.`);
-      pushNotification('SKU Not Found', `No exact SKU match for "${cleaned}".`, 'low_stock');
-
-      if (!keepOpen) {
-        if (stopCameraFn) await stopCameraFn();
-        if (allowCloseModal) {
-          setTimeout(() => closeScannerAnimated(), 1100);
-        }
-      } else {
-        setTimeout(() => {
-          scanLockedRef.current = false;
-        }, 1100);
-      }
-      return;
-    }
-
-    const qty = Math.max(1, Number(scanQuantityRef.current) || 1);
-    const delta = currentMode === 'add' ? qty : -qty;
-    const result = await adjustStock(matchedItem.id, delta, 'scan');
-    const resultingStock = result?.nextStock ?? Math.max(0, matchedItem.stock + delta);
-    const actualDelta = result?.actualDelta ?? delta;
-
-    if (playChime) playScanFeedbackChime(true, keepOpen);
-    const label = `${matchedItem.name} (${actualDelta >= 0 ? `+${actualDelta}` : actualDelta} → ${resultingStock})`;
-    setLastScannedSummary(label);
-    setScanSuccessBanner(`Scanned ${label}`);
-
-    if (!keepOpen) {
-      if (stopCameraFn) await stopCameraFn();
-      if (allowCloseModal) {
-        setTimeout(() => closeScannerAnimated(), unlockDelay);
-      }
-    } else {
-      setTimeout(() => {
-        scanLockedRef.current = false;
-      }, unlockDelay);
     }
   };
 
   useEffect(() => {
     let active = true;
+
+    const cleanupDomVideoTracks = () => {
+      const readerEl = document.getElementById('barcode-camera-reader');
+      if (!readerEl) return;
+      const videos = readerEl.querySelectorAll('video');
+      videos.forEach((video) => {
+        const stream = video.srcObject as MediaStream | null;
+        if (stream) {
+          stream.getTracks().forEach((track) => track.stop());
+          video.srcObject = null;
+        }
+      });
+    };
 
     const stopScanner = async () => {
       const instance = scannerInstanceRef.current;
@@ -1755,6 +2921,7 @@ export default function InventoryDashboard() {
           // Ignore clear errors
         }
       }
+      cleanupDomVideoTracks();
     };
 
     const startScanner = async () => {
@@ -1762,6 +2929,28 @@ export default function InventoryDashboard() {
         await stopScanner();
         return;
       }
+
+      if (typeof window !== 'undefined') {
+        const isLocalhost =
+          window.location.hostname === 'localhost' ||
+          window.location.hostname === '127.0.0.1' ||
+          window.location.hostname === '[::1]';
+        if (!window.isSecureContext && !isLocalhost) {
+          setScannerError(
+            'Camera requires HTTPS or localhost.'
+          );
+          return;
+        }
+        if (!navigator.mediaDevices || typeof navigator.mediaDevices.getUserMedia !== 'function') {
+          setScannerError(
+            'Camera API is unavailable in this browser.'
+          );
+          return;
+        }
+      }
+
+      await stopScanner();
+      if (!active) return;
 
       scanLockedRef.current = false;
       setScannerError(null);
@@ -1776,17 +2965,26 @@ export default function InventoryDashboard() {
         const scanner =
           scannerInstanceRef.current ||
           new Html5Qrcode('barcode-camera-reader', {
-            formatsToSupport: [Html5QrcodeSupportedFormats.CODE_128],
+            formatsToSupport: [
+              Html5QrcodeSupportedFormats.CODE_128,
+              Html5QrcodeSupportedFormats.CODE_39,
+              Html5QrcodeSupportedFormats.EAN_13,
+              Html5QrcodeSupportedFormats.EAN_8,
+              Html5QrcodeSupportedFormats.UPC_A,
+              Html5QrcodeSupportedFormats.UPC_E,
+              Html5QrcodeSupportedFormats.QR_CODE,
+            ],
+            useBarCodeDetectorIfSupported: true,
             verbose: false,
           });
         scannerInstanceRef.current = scanner;
 
         const scanConfig = {
-          fps: 18,
-          aspectRatio: 1.777,
+          fps: 20,
+          aspectRatio: 1.333,
           qrbox: (viewfinderWidth: number, viewfinderHeight: number) => {
-            const width = Math.min(340, Math.max(220, Math.floor(viewfinderWidth * 0.85)));
-            const height = Math.min(130, Math.max(85, Math.floor(viewfinderHeight * 0.42)));
+            const width = Math.min(280, Math.max(170, Math.floor(viewfinderWidth * 0.82)));
+            const height = Math.min(130, Math.max(76, Math.floor(viewfinderHeight * 0.55)));
             return { width, height };
           },
         };
@@ -1800,64 +2998,195 @@ export default function InventoryDashboard() {
           await processScannedCode(cleaned, stopScanner, true);
         };
 
-        const onFrameMiss = () => {
-          // Frame scan miss; continue scanning
-        };
+        const onFrameMiss = () => {};
+
+        let cameraDevices: { id: string; label: string }[] = [];
+        try {
+          const rawCams = await Html5Qrcode.getCameras();
+          if (rawCams && rawCams.length > 0) {
+            cameraDevices = rawCams.map((cam, idx) => ({
+              id: cam.id,
+              label: cam.label || `Camera ${idx + 1}`,
+            }));
+          }
+        } catch {}
 
         let started = false;
-        try {
-          const cameras = await Html5Qrcode.getCameras();
-          if (!active) return;
+        let lastStartError: any = null;
 
-          if (cameras && cameras.length > 0) {
-            const rearCam =
-              cameras.find((c) => /back|rear|environment/i.test(c.label)) ||
-              cameras[cameras.length - 1];
-            try {
-              await scanner.start(rearCam.id, scanConfig, onDecoded, onFrameMiss);
-              started = true;
-            } catch {
-              await scanner.start(cameras[0].id, scanConfig, onDecoded, onFrameMiss);
-              started = true;
-            }
+        const backCamId = cameraDevices.find((c) => /back|rear|environment/i.test(c.label))?.id;
+        if (backCamId) {
+          try {
+            await scanner.start(backCamId, scanConfig, onDecoded, onFrameMiss);
+            started = true;
+          } catch (err) {
+            lastStartError = err;
           }
-        } catch {
-          // Fall back to facingMode constraint below
         }
 
         if (!started && active) {
-          await scanner.start({ facingMode: 'environment' }, scanConfig, onDecoded, onFrameMiss);
+          try {
+            await scanner.start({ facingMode: 'environment' }, scanConfig, onDecoded, onFrameMiss);
+            started = true;
+          } catch (err) {
+            lastStartError = err;
+          }
         }
 
-        if (active) {
+        if (!started && active) {
+          try {
+            await scanner.start({ facingMode: 'user' }, scanConfig, onDecoded, onFrameMiss);
+            started = true;
+          } catch (err) {
+            lastStartError = err;
+          }
+        }
+
+        if (!started && cameraDevices.length > 0 && active) {
+          for (const cam of cameraDevices) {
+            try {
+              await scanner.start(cam.id, scanConfig, onDecoded, onFrameMiss);
+              started = true;
+              break;
+            } catch (err) {
+              lastStartError = err;
+            }
+          }
+        }
+
+        if (started && active) {
           scannerRunningRef.current = true;
+        } else if (active) {
+          const errName = String(lastStartError?.name || '');
+          const errMsg = String(lastStartError?.message || '');
+          if (/NotAllowedError|PermissionDenied/i.test(errName + errMsg)) {
+            setScannerError('Camera permission denied. Allow access and tap Retry.');
+          } else if (/NotFoundError|DevicesNotFound/i.test(errName + errMsg)) {
+            setScannerError('No camera detected on this device.');
+          } else if (/NotReadableError|TrackStartError|AbortError/i.test(errName + errMsg)) {
+            setScannerError('Camera is busy. Close other camera apps and tap Retry.');
+          } else {
+            setScannerError(`Camera could not start${errMsg ? ` (${errMsg})` : ''}. Tap Retry.`);
+          }
         }
       } catch (err: any) {
         if (active) {
           const detail = err?.message ? ` (${err.message})` : '';
-          setScannerError(
-            `Camera access failed${detail}. Check browser camera permissions/HTTPS, or type/USB-scan a SKU below.`
-          );
+          setScannerError(`Scanner failed to start${detail}.`);
         }
       }
     };
 
-    startScanner();
+    void startScanner();
 
     return () => {
       active = false;
-      stopScanner();
+      void stopScanner();
     };
-  }, [isScannerOpen, isScannerClosing]);
+  }, [isScannerOpen, isScannerClosing, cameraRestartNonce]);
 
   const filteredItems = useMemo(() => {
     return items.filter((item) => {
-      const matchesQuery = `${item.name} ${item.sku} ${(item.colors || []).join(' ')}`.toLowerCase().includes(query.toLowerCase());
+      const matchesQuery = `${item.name} ${item.sku} ${item.size} ${(item.colors || []).join(' ')}`.toLowerCase().includes(query.toLowerCase());
       const matchesStatus = statusFilter === 'ALL' || item.status === statusFilter;
       const matchesCategory = categoryFilter === 'ALL' || item.category === categoryFilter;
       return matchesQuery && matchesStatus && matchesCategory;
     });
   }, [items, query, statusFilter, categoryFilter]);
+
+  const groupedFilteredItems = useMemo(() => {
+    const groupMap = new Map<string, InventoryItem[]>();
+
+    categories.forEach((cat) => {
+      groupMap.set(cat.name, []);
+    });
+
+    filteredItems.forEach((item) => {
+      const catName = item.category?.trim() || 'Uncategorized';
+      if (!groupMap.has(catName)) {
+        groupMap.set(catName, []);
+      }
+      groupMap.get(catName)!.push(item);
+    });
+
+    const groups: {
+      category: string;
+      items: InventoryItem[];
+      totalStock: number;
+      lowCount: number;
+      allColors: string[];
+    }[] = [];
+
+    groupMap.forEach((groupItems, category) => {
+      if (groupItems.length === 0) return;
+      const totalStock = groupItems.reduce((sum, item) => sum + item.stock, 0);
+      const lowCount = groupItems.filter((item) => item.status === 'LOW' || item.status === 'OUT OF STOCK').length;
+      const allColors = Array.from(new Set(groupItems.flatMap((item) => item.colors || [])));
+      groups.push({
+        category,
+        items: groupItems,
+        totalStock,
+        lowCount,
+        allColors,
+      });
+    });
+
+    return groups;
+  }, [filteredItems, categories]);
+
+  const incomingDocuments = useMemo(
+    () => documents.filter((d) => d.kind === 'INCOMING'),
+    [documents]
+  );
+
+  const outgoingDocuments = useMemo(
+    () => documents.filter((d) => d.kind === 'OUTGOING'),
+    [documents]
+  );
+
+  const pendingIncomingCount = useMemo(
+    () => incomingDocuments.filter((d) => d.status === 'PENDING').length,
+    [incomingDocuments]
+  );
+
+  const pendingOutgoingCount = useMemo(
+    () => outgoingDocuments.filter((d) => d.status === 'PENDING').length,
+    [outgoingDocuments]
+  );
+
+  const incomingEntries = useMemo(() => {
+    return auditLog.filter((entry) => {
+      const parsed = parseMovementMeta(entry.detail || '', entry.action || '');
+      return (entry.direction || parsed.direction) === 'INCOMING';
+    });
+  }, [auditLog]);
+
+  const outgoingEntries = useMemo(() => {
+    return auditLog.filter((entry) => {
+      const parsed = parseMovementMeta(entry.detail || '', entry.action || '');
+      return (entry.direction || parsed.direction) === 'OUTGOING';
+    });
+  }, [auditLog]);
+
+  const totalIncomingUnits = useMemo(() => {
+    return incomingEntries.reduce((sum, entry) => {
+      const qty =
+        typeof entry.qtyDelta === 'number' && entry.qtyDelta > 0
+          ? entry.qtyDelta
+          : parseMovementMeta(entry.detail || '', entry.action || '').qtyDelta;
+      return sum + qty;
+    }, 0);
+  }, [incomingEntries]);
+
+  const totalOutgoingUnits = useMemo(() => {
+    return outgoingEntries.reduce((sum, entry) => {
+      const qty =
+        typeof entry.qtyDelta === 'number' && entry.qtyDelta > 0
+          ? entry.qtyDelta
+          : parseMovementMeta(entry.detail || '', entry.action || '').qtyDelta;
+      return sum + qty;
+    }, 0);
+  }, [outgoingEntries]);
 
   const hasActiveFilters = query.trim() !== '' || statusFilter !== 'ALL' || categoryFilter !== 'ALL';
 
@@ -1867,38 +3196,41 @@ export default function InventoryDashboard() {
     setCategoryFilter('ALL');
   };
 
-  const chartData = useMemo(() => {
-    const categoryTotals: Record<string, number> = {};
-    items.forEach((item) => {
-      categoryTotals[item.category] = (categoryTotals[item.category] || 0) + item.stock;
-    });
-    return Object.keys(categoryTotals).map((cat) => ({ category: cat, stock: categoryTotals[cat] }));
-  }, [items]);
-
   const totalValue = items.reduce((sum, item) => sum + item.stock * UNIT_ESTIMATED_PRICE, 0);
-  const lowStockItems = useMemo(() => items.filter((item) => item.status === 'LOW'), [items]);
+  const lowStockItems = useMemo(
+    () => items.filter((item) => item.status === 'LOW' || item.status === 'OUT OF STOCK'),
+    [items]
+  );
   const lowStockCount = lowStockItems.length;
 
   const copyRestockOrder = async () => {
     if (lowStockItems.length === 0) return;
     const lines = lowStockItems.map((item) => {
       const colorPart = item.colors.length ? ` [${item.colors.join(', ')}]` : '';
-      return `- ${item.name} (${item.sku || 'No SKU'}) • Size: ${item.size}${colorPart} • Stock: ${item.stock}/${item.min} → Needed Stock`;
+      return `- ${item.name} (${item.sku || 'No SKU'}) • Size/Type: ${item.size}${colorPart} • Stock: ${item.stock}/${item.min} → ${item.status}`;
     });
-    const text = `THE PRINTING DEPOT — RESTOCK LIST\n${lines.join('\n')}`;
+    const text = `THE PRINTING DEPOT — PROCUREMENT BUY LIST\n${lines.join('\n')}`;
     try {
       await navigator.clipboard.writeText(text);
       setCopiedRestockList(true);
-      pushNotification('Restock List Copied', `${lowStockItems.length} low-stock item(s) copied to clipboard.`, 'info');
+      pushNotification('Buy List Copied', `${lowStockItems.length} item(s) copied.`, 'info');
       setTimeout(() => setCopiedRestockList(false), 1800);
     } catch {
-      alert(text);
+      pushNotification('Copy Unavailable', 'Unable to access clipboard.', 'info');
     }
   };
 
-  const openCreateModal = () => {
+  const openCreateModal = (defaultCategory?: string) => {
     setEditingId(null);
-    setForm({ name: '', sku: '', category: categories[0]?.name || 'Shirts', size: 'M', stock: '0', min: '5', colors: [] });
+    setForm({
+      name: '',
+      sku: '',
+      category: defaultCategory || categories[0]?.name || 'Shirts',
+      size: 'M',
+      stock: '0',
+      min: '5',
+      colors: [],
+    });
     setPreviewSwatchName(null);
     setSaveSuccess(false);
     setIsSavingItem(false);
@@ -1952,11 +3284,23 @@ export default function InventoryDashboard() {
     if (isSavingItem || saveSuccess) return;
     setIsSavingItem(true);
 
-    const stockVal = Number(form.stock) || 0;
-    const minVal = Number(form.min) || 0;
-    const calculatedStatus: 'LOW' | 'OK' = stockVal <= minVal ? 'LOW' : 'OK';
+    const stockVal = Math.max(0, Number(form.stock) || 0);
+    const minVal = Math.max(0, Number(form.min) || 0);
+    const calculatedStatus: ItemStatus = computeItemStatus(stockVal, minVal);
+    const dbStatus = calculatedStatus === 'OUT OF STOCK' ? 'LOW' : calculatedStatus;
 
-    const payload = {
+    const dbPayload = {
+      name: form.name,
+      sku: form.sku,
+      category: form.category,
+      size: form.size,
+      stock: stockVal,
+      min: minVal,
+      status: dbStatus,
+      colors: form.colors,
+    };
+
+    const localPayload: Omit<InventoryItem, 'id'> = {
       name: form.name,
       sku: form.sku,
       category: form.category,
@@ -1970,8 +3314,12 @@ export default function InventoryDashboard() {
     const previousItems = itemsRef.current;
 
     if (editingId) {
+      const existingItem = previousItems.find((entry) => entry.id === editingId);
+      const prevStock = existingItem ? existingItem.stock : stockVal;
+      const stockDiff = stockVal - prevStock;
+
       const updatedList = previousItems.map((entry) =>
-        entry.id === editingId ? { ...entry, ...payload } : entry
+        entry.id === editingId ? { ...entry, ...localPayload } : entry
       );
       itemsRef.current = updatedList;
       setItems(updatedList);
@@ -1983,22 +3331,62 @@ export default function InventoryDashboard() {
         closeModalAnimated();
       }, 280);
 
-      void supabase.from('items').update(payload).eq('id', editingId).then(({ error }) => {
+      void supabase.from('items').update(dbPayload).eq('id', editingId).then(({ error }) => {
         if (error) {
           itemsRef.current = previousItems;
           setItems(previousItems);
-          alert('Error updating: ' + error.message);
+          pushNotification('Update Failed', error.message, 'info');
           return;
         }
-        void logAudit('EDIT ITEM', form.name, `Edited item details by ${actorName}`);
-        if (calculatedStatus === 'LOW') {
+        if (stockDiff > 0) {
+          void logAudit(
+            'PROCUREMENT',
+            form.name,
+            `+${stockDiff} units • Procurement buy / incoming stock (${prevStock} → ${stockVal} stock) by ${actorName}`,
+            'INCOMING',
+            stockDiff,
+            {
+              sku: form.sku,
+              size: form.size,
+              colors: form.colors,
+              previousStock: prevStock,
+              newStock: stockVal,
+              note: 'Procurement planning to buy',
+            }
+          );
+        } else if (stockDiff < 0) {
+          void logAudit(
+            'OUTGOING',
+            form.name,
+            `${stockDiff} units • Customer order going out (${prevStock} → ${stockVal} stock) by ${actorName}`,
+            'OUTGOING',
+            Math.abs(stockDiff),
+            {
+              sku: form.sku,
+              size: form.size,
+              colors: form.colors,
+              previousStock: prevStock,
+              newStock: stockVal,
+              note: 'Customer order fulfillment',
+            }
+          );
+        } else {
+          void logAudit('EDIT ITEM', form.name, `Edited item details by ${actorName}`, 'OTHER', 0, {
+            sku: form.sku,
+            size: form.size,
+            colors: form.colors,
+            previousStock: prevStock,
+            newStock: stockVal,
+          });
+        }
+        if (calculatedStatus === 'OUT OF STOCK' || calculatedStatus === 'LOW') {
           seenLowStockKeysRef.current.add(`${editingId}::${stockVal}::${minVal}`);
           void notifyAllUsersLowStock(form.name, form.sku, stockVal, minVal);
         }
       });
     } else {
       const tempId = `temp-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
-      const optimisticItem: InventoryItem = { id: tempId, ...payload };
+      const optimisticItem: InventoryItem = { id: tempId, ...localPayload };
       const updatedList = [optimisticItem, ...previousItems];
       itemsRef.current = updatedList;
       setItems(updatedList);
@@ -2011,14 +3399,14 @@ export default function InventoryDashboard() {
 
       void supabase
         .from('items')
-        .insert([payload])
+        .insert([dbPayload])
         .select('id')
         .single()
         .then(({ data, error }) => {
           if (error) {
             itemsRef.current = previousItems;
             setItems(previousItems);
-            alert('Error creating: ' + error.message);
+            pushNotification('Create Failed', error.message, 'info');
             return;
           }
           if (data?.id) {
@@ -2029,8 +3417,32 @@ export default function InventoryDashboard() {
             itemsRef.current = replaced;
             setItems(replaced);
           }
-          void logAudit('NEW ITEM', form.name, `Created new item by ${actorName}`);
-          if (calculatedStatus === 'LOW') {
+          if (stockVal > 0) {
+            void logAudit(
+              'PROCUREMENT',
+              form.name,
+              `+${stockVal} units • Initial procurement stock (0 → ${stockVal} stock) by ${actorName}`,
+              'INCOMING',
+              stockVal,
+              {
+                sku: form.sku,
+                size: form.size,
+                colors: form.colors,
+                previousStock: 0,
+                newStock: stockVal,
+                note: 'Initial procurement buy',
+              }
+            );
+          } else {
+            void logAudit('NEW ITEM', form.name, `Created new item (0 stock) by ${actorName}`, 'OTHER', 0, {
+              sku: form.sku,
+              size: form.size,
+              colors: form.colors,
+              previousStock: 0,
+              newStock: 0,
+            });
+          }
+          if (calculatedStatus === 'OUT OF STOCK' || calculatedStatus === 'LOW') {
             seenLowStockKeysRef.current.add(`${form.name}::${stockVal}::${minVal}`);
             void notifyAllUsersLowStock(form.name, form.sku, stockVal, minVal);
           }
@@ -2044,6 +3456,11 @@ export default function InventoryDashboard() {
     const filtered = previousItems.filter((entry) => entry.id !== itemId);
     itemsRef.current = filtered;
     setItems(filtered);
+    setSelectedBarcodeItemIds((prev) => {
+      const next = new Set(prev);
+      next.delete(itemId);
+      return next;
+    });
 
     void supabase.from('items').delete().eq('id', itemId).then(({ error }) => {
       if (error) {
@@ -2052,7 +3469,13 @@ export default function InventoryDashboard() {
         return;
       }
       if (item) {
-        void logAudit('REMOVE ITEM', item.name, `Removed item by ${actorName}`);
+        void logAudit('REMOVE ITEM', item.name, `Removed item by ${actorName}`, 'OTHER', 0, {
+          sku: item.sku,
+          size: item.size,
+          colors: item.colors,
+          previousStock: item.stock,
+          newStock: 0,
+        });
       }
     });
   };
@@ -2062,7 +3485,7 @@ export default function InventoryDashboard() {
     if (!cleanName || isAddingCategory || categoryAddSuccess) return;
 
     if (categories.some((cat) => cat.name.toLowerCase() === cleanName.toLowerCase())) {
-      alert('This category already exists.');
+      pushNotification('Duplicate Category', `"${cleanName}" already exists.`, 'info');
       return;
     }
 
@@ -2084,7 +3507,7 @@ export default function InventoryDashboard() {
       .then(({ data, error }) => {
         if (error) {
           setCategories(prevCategories);
-          alert('Error adding category: ' + error.message);
+          pushNotification('Category Error', error.message, 'info');
           return;
         }
         if (data?.id) {
@@ -2092,14 +3515,14 @@ export default function InventoryDashboard() {
             prev.map((cat) => (cat.id === tempId ? { ...cat, id: String(data.id) } : cat))
           );
         }
-        void logAudit('ADD CATEGORY', cleanName, `Added category by ${actorName}`);
+        void logAudit('ADD CATEGORY', cleanName, `Added category by ${actorName}`, 'OTHER', 0);
       });
   };
 
   const deleteCategory = (categoryId: string, categoryName: string) => {
     const hasItems = itemsRef.current.some((item) => item.category === categoryName);
     if (hasItems) {
-      alert(`Cannot remove "${categoryName}" while inventory items are assigned to it.`);
+      pushNotification('Category In Use', `Reassign items in "${categoryName}" first.`, 'info');
       return;
     }
 
@@ -2112,10 +3535,10 @@ export default function InventoryDashboard() {
     void supabase.from('categories').delete().eq('id', categoryId).then(({ error }) => {
       if (error) {
         setCategories(prevCategories);
-        alert('Error deleting category: ' + error.message);
+        pushNotification('Category Error', error.message, 'info');
         return;
       }
-      void logAudit('REMOVE CATEGORY', categoryName, `Removed category by ${actorName}`);
+      void logAudit('REMOVE CATEGORY', categoryName, `Removed category by ${actorName}`, 'OTHER', 0);
     });
   };
 
@@ -2143,11 +3566,469 @@ export default function InventoryDashboard() {
     }
   };
 
+  const handleExportPdfChoice = (choice: 'all' | 'filtered') => {
+    if (choice === 'all') {
+      openInventoryPdfReport(
+        'Complete Inventory Report',
+        'All inventory items across all categories and statuses',
+        items
+      );
+    } else {
+      const filterDesc = [
+        query.trim() ? `Search: "${query.trim()}"` : null,
+        statusFilter !== 'ALL' ? `Status: ${statusFilter}` : null,
+        categoryFilter !== 'ALL' ? `Category: ${categoryFilter}` : null,
+      ]
+        .filter(Boolean)
+        .join(' • ');
+
+      openInventoryPdfReport(
+        'Filtered Inventory Report',
+        filterDesc || 'Current filtered / displayed inventory items',
+        filteredItems
+      );
+    }
+  };
+
+  const renderStockDocumentCard = (doc: StockDocument) => {
+    const isIncoming = doc.kind === 'INCOMING';
+    const isPending = doc.status === 'PENDING';
+    const totalUnits = doc.goods.reduce((sum, line) => sum + line.qty, 0);
+
+    return (
+      <div
+        key={doc.id}
+        className={`rounded-2xl border p-4 transition-all duration-200 ${
+          isPending
+            ? isIncoming
+              ? 'border-emerald-500/45 bg-emerald-500/10'
+              : 'border-amber-500/45 bg-amber-500/10'
+            : `${t.border} ${t.cardBg3}`
+        }`}
+      >
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div className="min-w-0 flex-1">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="font-black text-sm">{doc.docNo}</span>
+              <span
+                className={`rounded-full border px-2.5 py-0.5 text-[10px] font-bold ${
+                  isPending
+                    ? isIncoming
+                      ? t.incomingBadge
+                      : t.outgoingBadge
+                    : t.okBg
+                }`}
+              >
+                {isPending
+                  ? isIncoming
+                    ? 'PENDING'
+                    : 'PENDING'
+                  : isIncoming
+                    ? 'ADDED'
+                    : 'DEDUCTED'}
+              </span>
+              <span className={`rounded-full border ${t.badgeBg} px-2 py-0.5 text-[10px] font-bold tabular-nums`}>
+                {totalUnits} qty
+              </span>
+            </div>
+
+            <div className={`mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs ${t.textMuted}`}>
+              {doc.partyName && doc.partyName !== 'Select' && (
+                <span>
+                  <strong>{isIncoming ? 'Supplier:' : 'Customer:'}</strong> {doc.partyName}
+                </span>
+              )}
+              <span className="tabular-nums">{doc.dateTime}</span>
+              {doc.description && <span>&bull; {doc.description}</span>}
+            </div>
+          </div>
+
+          <div className="flex items-center gap-1.5 shrink-0">
+            {isPending && (
+              <button
+                type="button"
+                onClick={() => void commitDocumentToInventory(doc.id)}
+                title={
+                  isIncoming
+                    ? 'Add goods to inventory'
+                    : 'Deduct goods from stock'
+                }
+                aria-label="Confirm and apply to stock"
+                className="tpd-click-press inline-flex items-center gap-1 rounded-xl border border-emerald-500 bg-emerald-600 px-3 py-1.5 text-xs font-extrabold text-white shadow-sm hover:bg-emerald-700"
+              >
+                <Check size={14} strokeWidth={3} />
+                <span>{isIncoming ? 'Arrive & Add' : 'Deduct Stock'}</span>
+              </button>
+            )}
+            {isPending && (
+              <button
+                type="button"
+                onClick={() => openEditDocumentModal(doc)}
+                title="Edit document"
+                className={`tpd-click-press rounded-xl border ${t.border} ${t.btnSecondary} p-1.5`}
+              >
+                <Edit3 size={13} />
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={() => void deleteStockDocument(doc.id)}
+              title="Delete document"
+              className={`tpd-click-press rounded-xl border ${t.border} p-1.5 ${t.dangerText} hover:bg-red-500/15`}
+            >
+              <Trash2 size={13} />
+            </button>
+          </div>
+        </div>
+
+        <div className={`mt-3 space-y-1.5 border-t ${t.border} pt-2.5`}>
+          {doc.goods.map((line) => {
+            const matchedInv = items.find(
+              (inv) =>
+                (line.itemId && inv.id === line.itemId) ||
+                (line.sku && inv.sku.trim().toLowerCase() === line.sku.trim().toLowerCase())
+            );
+            const projectedStock = matchedInv
+              ? isIncoming
+                ? matchedInv.stock + line.qty
+                : Math.max(0, matchedInv.stock - line.qty)
+              : isIncoming
+                ? line.qty
+                : 0;
+
+            return (
+              <div
+                key={line.id}
+                className={`flex flex-wrap items-center justify-between gap-2 rounded-xl border ${t.border} ${t.cardBg2} px-3 py-2 text-xs`}
+              >
+                <div className="min-w-0">
+                  <span className="font-bold">{line.name}</span>
+                  {line.isNewCatalogItem && (
+                    <span className={`ml-1.5 rounded-full border ${t.badgeBg} px-1.5 py-0.5 text-[9px] font-bold`}>
+                      NEW
+                    </span>
+                  )}
+                  {line.sku && <span className={`ml-2 font-mono text-[11px] ${t.textMuted2}`}>{line.sku}</span>}
+                  {line.size && <span className={`ml-2 text-[11px] ${t.textMuted}`}>({line.size})</span>}
+                  {(line.colors || []).length > 0 && (
+                    <span className="ml-2 inline-flex items-center gap-1 align-middle">
+                      {(line.colors || []).map((c) => (
+                        <ColorCircle key={c} color={c} size="sm" />
+                      ))}
+                    </span>
+                  )}
+                </div>
+                <div className="flex items-center gap-2 shrink-0 tabular-nums">
+                  <span className="font-extrabold">
+                    {isIncoming ? `+${line.qty}` : `-${line.qty}`}
+                  </span>
+                  {isPending && (
+                    <span className={`text-[11px] ${t.textMuted2}`}>
+                      ({matchedInv ? matchedInv.stock : 0} → {projectedStock})
+                    </span>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    );
+  };
+
+  const renderMovementCard = (entry: AuditEntry, kind: 'incoming' | 'outgoing') => {
+    const parsed = parseMovementMeta(entry.detail || '', entry.action || '');
+    const meta = entry.meta || parsed.meta;
+    const qty =
+      typeof entry.qtyDelta === 'number' && entry.qtyDelta > 0 ? entry.qtyDelta : parsed.qtyDelta;
+    const isIncoming = kind === 'incoming';
+
+    return (
+      <div
+        key={entry.id}
+        className={`rounded-2xl border ${t.border} ${t.cardBgHover} p-3.5 transition-all duration-200 ease-out motion-reduce:transition-none`}
+      >
+        <div className="flex items-start justify-between gap-3">
+          <div className="min-w-0 flex-1">
+            <div className="flex flex-wrap items-center gap-2">
+              <p className="font-bold text-sm truncate">{entry.item}</p>
+              <span
+                className={`rounded-full border px-2 py-0.5 text-[10px] font-bold shrink-0 ${
+                  isIncoming ? t.incomingBadge : t.outgoingBadge
+                }`}
+              >
+                {isIncoming ? 'PROCUREMENT' : 'OUTGOING'}
+              </span>
+              {qty > 0 && (
+                <span className={`rounded-full border ${t.badgeBg} px-2 py-0.5 text-[10px] font-extrabold tabular-nums`}>
+                  {isIncoming ? `+${qty}` : `-${qty}`}
+                </span>
+              )}
+            </div>
+
+            <p className={`mt-1 text-xs ${t.textMuted}`}>{entry.detail}</p>
+
+            <div className="mt-2 flex flex-wrap items-center gap-1.5 text-[11px]">
+              {meta?.docNo && (
+                <span className={`rounded-lg border ${t.badgeBg} px-2 py-0.5 font-bold`}>
+                  {meta.docNo}
+                </span>
+              )}
+              {meta?.partyName && meta.partyName !== 'Select' && (
+                <span className={`rounded-lg border ${t.badgeBg} px-2 py-0.5`}>
+                  {meta.partyName}
+                </span>
+              )}
+              {meta?.sku && (
+                <span className={`rounded-lg border ${t.badgeBg} px-2 py-0.5 font-mono`}>
+                  {meta.sku}
+                </span>
+              )}
+              {typeof meta?.previousStock === 'number' && typeof meta?.newStock === 'number' && (
+                <span className={`rounded-lg border ${t.badgeBg} px-2 py-0.5 font-semibold tabular-nums`}>
+                  {meta.previousStock} → {meta.newStock}
+                </span>
+              )}
+            </div>
+
+            {entry.user && (
+              <p className={`mt-1.5 text-[11px] font-medium ${t.successText} truncate`}>
+                By: {entry.user}
+              </p>
+            )}
+          </div>
+
+          <div className={`text-right text-xs ${t.textMuted2} shrink-0 tabular-nums`}>
+            <p className="font-semibold">{entry.action}</p>
+            <p>{entry.time}</p>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  const renderInventoryCard = (item: InventoryItem) => {
+    const isExpanded = Boolean(expandedBarcodes[item.id]);
+    const isPulsed = Boolean(pulsedItemIds[item.id]);
+    const isBarcodeSelected = selectedBarcodeItemIds.has(item.id);
+    const customQty = Math.max(1, Number(customCardQty[item.id]) || 5);
+    const copiesCount = getItemPrintCopies(item.id);
+    const barcodeItemSizeLabel = formatBarcodeItemSizeLabel(item.name, item.size);
+    const isOutOfStock = item.stock <= 0 || item.status === 'OUT OF STOCK';
+
+    return (
+      <div
+        key={item.id}
+        className={`rounded-2xl border p-3.5 sm:p-4 transition-all duration-200 ease-out motion-reduce:transition-none hover:-translate-y-0.5 hover:shadow-lg ${
+          isBarcodeSelected
+            ? 'border-sky-400/70 ring-2 ring-sky-400/20'
+            : isPulsed
+              ? 'border-emerald-500/70 ring-2 ring-emerald-500/20'
+              : t.border
+        } ${t.cardBgHover}`}
+      >
+        <div className="flex items-start justify-between gap-2">
+          <div className="flex items-start gap-2.5 min-w-0 flex-1">
+            {barcodeSelectMode && (
+              <input
+                type="checkbox"
+                checked={isBarcodeSelected}
+                onChange={() => toggleBarcodeSelection(item.id)}
+                aria-label={`Select barcode for ${item.name}`}
+                className="mt-1 h-4 w-4 rounded border-zinc-600 accent-sky-400 cursor-pointer shrink-0"
+              />
+            )}
+            <div className="min-w-0 flex-1">
+              <p className="font-semibold text-sm sm:text-base truncate">{item.name}</p>
+              <p className={`text-xs ${t.textMuted2} truncate`}>{item.sku} &bull; {item.size}</p>
+            </div>
+          </div>
+          <div className="flex items-center gap-2 shrink-0">
+            <span className={`rounded-full border ${t.badgeBg} px-2 py-0.5 text-[11px]`}>{item.category}</span>
+            <span className={`rounded-full border px-2.5 py-0.5 text-[11px] font-semibold transition-transform duration-200 ease-out motion-reduce:transition-none hover:scale-105 ${getStatusBadgeStyle(item.status)}`}>
+              {item.status}
+            </span>
+          </div>
+        </div>
+
+        <div className="mt-3 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <div className="flex items-center justify-between sm:justify-start sm:gap-4 text-xs tabular-nums">
+            <span className={t.textMuted}>
+              Stock:{' '}
+              <strong
+                className={`inline-block transition-transform duration-200 ease-out motion-reduce:transition-none ${
+                  isPulsed
+                    ? `scale-110 ${t.successText}`
+                    : isOutOfStock
+                      ? `${t.dangerText} font-black`
+                      : t.text
+                }`}
+              >
+                {item.stock}
+              </strong>
+            </span>
+            <span className={t.textMuted}>Min: {item.min}</span>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-1.5 shrink-0">
+            <button onClick={() => adjustStock(item.id, -5, 'button')} title="Outgoing -5" className={`tpd-click-press rounded-full border ${t.border} ${t.btnSecondary} px-2 py-1 text-[11px] font-semibold tabular-nums`}>-5</button>
+            <button onClick={() => adjustStock(item.id, -1, 'button')} title="Outgoing -1" className={`tpd-click-press rounded-full border ${t.border} ${t.btnSecondary} px-2.5 py-1 text-xs font-semibold`}>-</button>
+            <button onClick={() => adjustStock(item.id, 1, 'button')} title="Procurement +1" className={`tpd-click-press rounded-full border ${t.border} ${t.btnSecondary} px-2.5 py-1 text-xs font-semibold`}>+</button>
+            <button onClick={() => adjustStock(item.id, 5, 'button')} title="Procurement +5" className={`tpd-click-press rounded-full border ${t.border} ${t.btnSecondary} px-2 py-1 text-[11px] font-semibold tabular-nums`}>+5</button>
+            <button onClick={() => adjustStock(item.id, 10, 'button')} title="Procurement +10" className={`tpd-click-press rounded-full border ${t.border} ${t.btnSecondary} px-2 py-1 text-[11px] font-semibold tabular-nums`}>+10</button>
+
+            <div className={`inline-flex items-center rounded-full border ${t.border} ${t.inputBg} pl-1.5 pr-1 py-0.5`}>
+              <input
+                type="number"
+                min={1}
+                value={customQty}
+                onChange={(e) => {
+                  const parsed = parseInt(e.target.value, 10);
+                  setCustomCardQty((prev) => ({
+                    ...prev,
+                    [item.id]: Number.isNaN(parsed) ? 1 : Math.max(1, parsed),
+                  }));
+                }}
+                aria-label={`Custom quantity for ${item.name}`}
+                className={`w-11 bg-transparent text-center text-base sm:text-[11px] font-bold tabular-nums outline-none ${t.text}`}
+              />
+              <button
+                type="button"
+                onClick={() => adjustStock(item.id, customQty, 'button')}
+                title={`Add +${customQty}`}
+                className={`tpd-click-press rounded-full border ${t.btnPrimary} px-2 py-0.5 text-[10px] font-bold tabular-nums`}
+              >
+                +{customQty}
+              </button>
+            </div>
+
+            <button
+              type="button"
+              onClick={() => openDuplicateModal(item)}
+              title="Duplicate item"
+              aria-label="Duplicate item"
+              className={`tpd-click-press rounded-full border ${t.border} ${t.btnSecondary} p-1.5`}
+            >
+              <Copy size={13} />
+            </button>
+            <button onClick={() => openEditModal(item)} title="Edit item" aria-label="Edit item" className={`tpd-click-press rounded-full border ${t.border} ${t.btnSecondary} p-1.5`}><Edit3 size={13} /></button>
+            <button onClick={() => deleteItem(item.id)} title="Delete item" aria-label="Delete item" className={`tpd-click-press rounded-full border ${t.border} ${t.btnSecondary} p-1.5 ${t.dangerText}`}><Trash2 size={13} /></button>
+          </div>
+        </div>
+
+        {(item.colors || []).length > 0 && (
+          <div className={`mt-3 flex flex-wrap gap-1.5 pt-2 border-t ${t.border}`}>
+            {(item.colors || []).map((color) => (
+              <span key={color} className={`group flex items-center gap-2 rounded-full border ${t.badgeBg} px-2.5 py-0.5 text-[11px] transition-transform duration-150 ease-out motion-reduce:transition-none hover:scale-105`}>
+                <ColorCircle color={color} size="sm" />
+                <span>{color}</span>
+              </span>
+            ))}
+          </div>
+        )}
+
+        {item.sku && (
+          <div className={`mt-3 pt-2 border-t ${t.border}`}>
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <button
+                type="button"
+                onClick={() => toggleBarcodeExpand(item.id)}
+                className={`tpd-click-press inline-flex items-center gap-1.5 rounded-xl border ${t.border} ${t.cardBg3} px-2.5 py-1 text-[11px] font-medium ${t.textMuted} transition-all duration-150 ease-out motion-reduce:transition-none hover:scale-105`}
+              >
+                {isExpanded ? <ChevronUp size={13} /> : <ChevronDown size={13} />}
+                <span>{isExpanded ? 'Hide Barcode' : 'Barcode'}</span>
+              </button>
+
+              <div className="flex flex-wrap items-center gap-1.5">
+                <div className={`inline-flex items-center gap-1 rounded-xl border ${t.border} ${t.cardBg3} px-2 py-0.5 text-[11px]`}>
+                  <span className={t.textMuted}>Copies</span>
+                  <input
+                    type="number"
+                    min={1}
+                    max={100}
+                    value={copiesCount}
+                    onChange={(e) => setItemPrintCopies(item.id, parseInt(e.target.value, 10))}
+                    aria-label={`Print copies for ${item.name}`}
+                    className={`w-12 bg-transparent text-center text-base sm:text-[11px] font-bold tabular-nums outline-none ${t.text}`}
+                  />
+                  {[1, 5, 10].map((preset) => (
+                    <button
+                      key={preset}
+                      type="button"
+                      onClick={() => setItemPrintCopies(item.id, preset)}
+                      className={`rounded-md px-1 py-0.5 text-[10px] font-semibold tabular-nums transition-colors ${
+                        copiesCount === preset ? t.tabActive : `${t.textMuted} hover:opacity-80`
+                      }`}
+                    >
+                      {preset}
+                    </button>
+                  ))}
+                </div>
+                <button
+                  type="button"
+                  onClick={() => downloadBarcodePng(item)}
+                  className={`inline-flex items-center gap-1.5 rounded-xl border ${t.btnSecondary} px-2.5 py-1 text-[11px] font-semibold transition-all duration-200 ease-out motion-reduce:transition-none`}
+                >
+                  <Download size={12} />
+                  <span>Save</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => printBarcodeLabel(item, copiesCount)}
+                  className={`inline-flex items-center gap-1.5 rounded-xl border ${t.btnSecondary} px-2.5 py-1 text-[11px] font-semibold transition-all duration-200 ease-out motion-reduce:transition-none tabular-nums`}
+                >
+                  <Printer size={12} />
+                  <span>Print ({copiesCount})</span>
+                </button>
+              </div>
+            </div>
+
+            <div className={isExpanded ? 'tpd-pop-enter mt-2.5 block' : 'hidden'}>
+              <div
+                className={`inline-flex flex-col items-center rounded-xl border border-zinc-300 bg-white text-black shadow-sm ${
+                  labelFormat === 'full' ? 'px-4 py-3 min-w-[220px]' : 'px-3 py-2'
+                }`}
+              >
+                {labelFormat === 'full' && (
+                  <span className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-zinc-600">
+                    {item.category || 'Item'} &bull; {item.size || '-'}
+                  </span>
+                )}
+                <div className="mb-1 flex items-center justify-center gap-1.5">
+                  <span className="text-[11px] font-extrabold tracking-wider text-black">
+                    {barcodeItemSizeLabel}
+                  </span>
+                  {renderLabelColorDots(item.colors)}
+                </div>
+                <div id={`barcode-label-${item.id}`}>
+                  <Barcode
+                    value={item.sku}
+                    format="CODE128"
+                    height={labelFormat === 'full' ? 36 : 32}
+                    width={1.3}
+                    fontSize={11}
+                    margin={2}
+                  />
+                </div>
+                {labelFormat === 'full' && (item.colors || []).length > 0 && (
+                  <span className="mt-1 text-[10px] font-medium text-zinc-700">
+                    Colors: {(item.colors || []).join(', ')}
+                  </span>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+    );
+  };
+
   if (authLoading) {
     return (
-      <main className={`flex min-h-screen items-center justify-center ${t.bg} ${t.text}`}>
-        <div className="flex flex-col items-center gap-3">
-          <div className="h-8 w-8 animate-spin motion-reduce:animate-none rounded-full border-2 border-zinc-600 border-t-white" />
+      <main className={`relative flex min-h-screen items-center justify-center ${t.text}`}>
+        <FrostedBackgroundLayer darkMode={darkMode} />
+        <div className={`relative z-10 flex flex-col items-center gap-3 rounded-3xl border ${t.border} ${t.cardBg} px-8 py-6 shadow-2xl`}>
+          <div className="h-8 w-8 animate-spin motion-reduce:animate-none rounded-full border-2 border-zinc-500 border-t-current" />
           <p className={`text-sm ${t.textMuted}`}>Loading The Printing Depot...</p>
         </div>
       </main>
@@ -2156,8 +4037,9 @@ export default function InventoryDashboard() {
 
   if (!user) {
     return (
-      <main className={`flex min-h-screen items-center justify-center px-4 py-10 ${t.bg} ${t.text} overflow-x-hidden`}>
-        <div className={`tpd-modal-enter w-full max-w-md rounded-3xl border ${t.border} ${t.cardBg2} p-6 sm:p-8 shadow-2xl transition-all duration-300 ease-out motion-reduce:transition-none`}>
+      <main className={`relative flex min-h-screen items-center justify-center px-4 py-10 ${t.text} overflow-x-hidden`}>
+        <FrostedBackgroundLayer darkMode={darkMode} />
+        <div className={`tpd-modal-enter relative z-10 w-full max-w-md rounded-3xl border ${t.border} ${t.cardBg2} p-6 sm:p-8 shadow-2xl transition-all duration-300 ease-out motion-reduce:transition-none`}>
           <div className="flex items-start justify-between gap-3">
             <div className="flex items-center gap-3 min-w-0">
               <PrintingDepotLogo darkMode={darkMode} size="md" />
@@ -2172,7 +4054,7 @@ export default function InventoryDashboard() {
               aria-label="Toggle theme"
               className={`tpd-click-press shrink-0 rounded-2xl border ${t.border} ${t.cardBg} p-2.5 transition-all duration-300 ease-out motion-reduce:transition-none hover:scale-105`}
             >
-              {darkMode ? <Sun size={18} className="text-yellow-300 transition-transform duration-500 ease-out motion-reduce:transition-none hover:rotate-45" /> : <Moon size={18} className="text-zinc-700 transition-transform duration-500 ease-out motion-reduce:transition-none hover:-rotate-12" />}
+              {darkMode ? <Sun size={18} className="text-yellow-300" /> : <Moon size={18} className="text-zinc-700" />}
             </button>
           </div>
 
@@ -2190,13 +4072,13 @@ export default function InventoryDashboard() {
             <div className={`h-px flex-1 border-t ${t.border}`} />
           </div>
 
-          {authError && <div className="tpd-pop-enter mb-4 rounded-2xl border border-red-900/50 bg-red-950/40 px-4 py-3 text-xs text-red-300">{authError}</div>}
-          {authMessage && <div className="tpd-pop-enter mb-4 rounded-2xl border border-emerald-900/50 bg-emerald-950/40 px-4 py-3 text-xs text-emerald-300">{authMessage}</div>}
+          {authError && <div className={`tpd-pop-enter mb-4 rounded-2xl border ${t.lowBg} px-4 py-3 text-xs font-medium`}>{authError}</div>}
+          {authMessage && <div className={`tpd-pop-enter mb-4 rounded-2xl border ${t.okBg} px-4 py-3 text-xs font-medium`}>{authMessage}</div>}
 
           <form onSubmit={handleManualAuth} className="space-y-4">
             <div>
               <label className={`mb-1.5 block text-xs font-medium ${t.textMuted}`}>Email Address</label>
-              <div className={`flex items-center gap-2.5 rounded-2xl border ${t.border} ${t.inputBg} px-3.5 py-2.5 transition-colors duration-300 ease-out focus-within:border-zinc-500`}>
+              <div className={`flex items-center gap-2.5 rounded-2xl border ${t.border} ${t.inputBg} px-3.5 py-2.5`}>
                 <Mail size={16} className={iconClass} />
                 <input type="email" required value={authEmail} onChange={(e) => setAuthEmail(e.target.value)} placeholder="name@printingdepot.ph" className={`w-full bg-transparent text-base sm:text-sm outline-none ${t.text}`} />
               </div>
@@ -2204,7 +4086,7 @@ export default function InventoryDashboard() {
 
             <div>
               <label className={`mb-1.5 block text-xs font-medium ${t.textMuted}`}>Password</label>
-              <div className={`flex items-center gap-2.5 rounded-2xl border ${t.border} ${t.inputBg} px-3.5 py-2.5 transition-colors duration-300 ease-out focus-within:border-zinc-500`}>
+              <div className={`flex items-center gap-2.5 rounded-2xl border ${t.border} ${t.inputBg} px-3.5 py-2.5`}>
                 <Lock size={16} className={iconClass} />
                 <input type="password" required minLength={6} value={authPassword} onChange={(e) => setAuthPassword(e.target.value)} placeholder="••••••••" className={`w-full bg-transparent text-base sm:text-sm outline-none ${t.text}`} />
               </div>
@@ -2219,73 +4101,16 @@ export default function InventoryDashboard() {
             {authMode === 'login' ? (
               <p className={t.textMuted}>
                 Don&apos;t have an account?{' '}
-                <button type="button" onClick={() => setAuthMode('signup')} className="tpd-click-press font-semibold underline underline-offset-4 transition-opacity duration-200 hover:opacity-80">Create account</button>
+                <button type="button" onClick={() => setAuthMode('signup')} className="tpd-click-press font-semibold underline underline-offset-4">Create account</button>
               </p>
             ) : (
               <p className={t.textMuted}>
                 Already have an account?{' '}
-                <button type="button" onClick={() => setAuthMode('login')} className="tpd-click-press font-semibold underline underline-offset-4 transition-opacity duration-200 hover:opacity-80">Log in</button>
+                <button type="button" onClick={() => setAuthMode('login')} className="tpd-click-press font-semibold underline underline-offset-4">Log in</button>
               </p>
             )}
           </div>
         </div>
-
-        <style jsx>{`
-          .tpd-click-press {
-            transition: transform 200ms cubic-bezier(0.22, 1, 0.36, 1), background-color 180ms ease, box-shadow 180ms ease, border-color 180ms ease, opacity 160ms ease;
-          }
-          .tpd-click-press:active {
-            transform: scale(0.94);
-            transition-duration: 110ms;
-          }
-          .tpd-modal-enter {
-            animation: tpdModalIn 260ms cubic-bezier(0.22, 1, 0.36, 1) both;
-          }
-          .tpd-pop-enter {
-            animation: tpdPopIn 220ms cubic-bezier(0.22, 1, 0.36, 1) both;
-          }
-          .tpd-logo-mark {
-            animation: tpdLogoFloat 3.6s ease-in-out infinite;
-          }
-          @keyframes tpdModalIn {
-            from {
-              opacity: 0;
-              transform: translateY(12px) scale(0.97);
-            }
-            to {
-              opacity: 1;
-              transform: translateY(0) scale(1);
-            }
-          }
-          @keyframes tpdPopIn {
-            from {
-              opacity: 0;
-              transform: translateY(-6px) scale(0.97);
-            }
-            to {
-              opacity: 1;
-              transform: translateY(0) scale(1);
-            }
-          }
-          @keyframes tpdLogoFloat {
-            0%, 100% {
-              transform: translateY(0);
-            }
-            50% {
-              transform: translateY(-2px);
-            }
-          }
-          @media (prefers-reduced-motion: reduce) {
-            .tpd-click-press,
-            .tpd-click-press:active,
-            .tpd-modal-enter,
-            .tpd-pop-enter,
-            .tpd-logo-mark {
-              animation: none !important;
-              transform: none !important;
-            }
-          }
-        `}</style>
       </main>
     );
   }
@@ -2296,6 +4121,7 @@ export default function InventoryDashboard() {
 
   const statusOptions: CascadeSelectOption[] = [
     { value: 'ALL', label: 'All status' },
+    { value: 'OUT OF STOCK', label: 'Out of stock' },
     { value: 'LOW', label: 'Low' },
     { value: 'OK', label: 'Ok' },
   ];
@@ -2310,25 +4136,46 @@ export default function InventoryDashboard() {
     label: category.name,
   }));
 
+  const partyOptions: CascadeSelectOption[] = (
+    docKind === 'INCOMING' ? DEFAULT_SUPPLIERS : DEFAULT_CUSTOMERS
+  ).map((p) => ({ value: p, label: p }));
+
+  const filteredDocGoods = docGoods.filter((line) =>
+    `${line.name} ${line.sku} ${line.size} ${line.category}`
+      .toLowerCase()
+      .includes(docGoodsSearch.toLowerCase())
+  );
+
+  const catalogSearchResults = items.filter((entry) =>
+    `${entry.name} ${entry.sku} ${entry.category} ${entry.size}`
+      .toLowerCase()
+      .includes(addGoodCatalogQuery.toLowerCase())
+  );
+
+  const printableFilteredItems = filteredItems.filter((entry) => Boolean(entry.sku));
+  const selectedPrintableCount = items.filter(
+    (entry) => selectedBarcodeItemIds.has(entry.id) && Boolean(entry.sku)
+  ).length;
+
   return (
-    <main className={`min-h-screen ${t.bg} ${t.text} transition-colors duration-200 motion-reduce:transition-none overflow-x-hidden`}>
-      {/* Messenger-style Top Pop-Up Notification for Low Stock */}
+    <main className={`relative min-h-screen ${t.text} transition-colors duration-200 motion-reduce:transition-none overflow-x-hidden`}>
+      <FrostedBackgroundLayer darkMode={darkMode} />
+
       {topLowStockBanner && showLowStockPopUp && (
-        <div className="fixed top-4 left-1/2 z-50 w-full max-w-md -translate-x-1/2 px-3 pointer-events-none">
+        <div className="fixed top-4 left-1/2 z-[60] w-full max-w-md -translate-x-1/2 px-3 pointer-events-none">
           <div
             className={`${
               topLowStockBanner.closing ? 'tpd-msg-top-exit' : 'tpd-msg-top-enter'
-            } pointer-events-auto flex items-center justify-between gap-3 rounded-full border border-red-500/50 ${t.cardBg2} px-4 py-2.5 shadow-2xl backdrop-blur-md`}
+            } pointer-events-auto flex items-center justify-between gap-3 rounded-full border ${t.needsRestockBorder} ${t.modalBg} px-4 py-2.5 shadow-2xl`}
           >
             <div className="flex items-center gap-3 min-w-0">
-              <div className="relative flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-red-500/20 text-red-400">
+              <div className={`relative flex h-9 w-9 shrink-0 items-center justify-center rounded-full ${t.lowBg} ${t.dangerText}`}>
                 <AlertTriangle size={18} />
-                <span className="absolute -bottom-0.5 -right-0.5 h-3 w-3 rounded-full border-2 border-zinc-950 bg-red-500" />
               </div>
               <div className="min-w-0">
                 <div className="flex items-center gap-1.5">
-                  <span className="text-[10px] font-extrabold uppercase tracking-wider text-red-400">
-                    Low Stock Alert
+                  <span className={`text-[10px] font-extrabold uppercase tracking-wider ${t.dangerText}`}>
+                    Alert
                   </span>
                   <span className={`text-[10px] ${t.textMuted2} tabular-nums`}>
                     &bull; {topLowStockBanner.time}
@@ -2341,8 +4188,8 @@ export default function InventoryDashboard() {
             <button
               type="button"
               onClick={dismissTopLowStockBanner}
-              aria-label="Dismiss low stock alert"
-              className={`tpd-click-press rounded-full p-1.5 ${t.textMuted} hover:bg-zinc-800 hover:text-white shrink-0`}
+              aria-label="Dismiss stock alert"
+              className={`tpd-click-press rounded-full p-1.5 ${t.textMuted} hover:bg-black/10 shrink-0`}
             >
               <X size={14} />
             </button>
@@ -2350,13 +4197,13 @@ export default function InventoryDashboard() {
         </div>
       )}
 
-      <div className="mx-auto flex max-w-7xl flex-col gap-6 px-3 sm:px-6 lg:px-8 py-4 sm:py-6">
-        <header className={`relative flex flex-col gap-4 rounded-3xl border ${t.border} ${t.cardBg} p-4 sm:p-5 shadow-2xl transition-colors duration-200 motion-reduce:transition-none lg:flex-row lg:items-center lg:justify-between`}>
+      <div className="relative z-10 mx-auto flex max-w-7xl flex-col gap-6 px-3 sm:px-6 lg:px-8 py-4 sm:py-6">
+        <header className={`relative z-30 flex flex-col gap-4 rounded-3xl border ${t.border} ${t.cardBg} p-4 sm:p-5 shadow-2xl transition-colors duration-200 motion-reduce:transition-none lg:flex-row lg:items-center lg:justify-between`}>
           <div className="flex items-center justify-between lg:justify-start lg:gap-4">
             <div className="flex items-center gap-3 min-w-0 flex-1">
               <PrintingDepotLogo darkMode={darkMode} size="sm" />
               <div className="min-w-0 flex-1">
-                <p className={`text-[10px] sm:text-xs uppercase tracking-[0.3em] ${t.textMuted}`}>INVENTORY MANAGEMENT SYSTEM</p>
+                <p className={`text-[10px] sm:text-xs uppercase tracking-[0.3em] ${t.textMuted}`}>INVENTORY SYSTEM</p>
                 <h1 className="mt-0.5 text-lg sm:text-2xl font-black tracking-tight lg:text-3xl truncate">THE PRINTING DEPOT</h1>
                 <p className={`mt-0.5 text-xs ${t.textMuted} truncate`}>Signed in as <span className="font-semibold">{actorName}</span></p>
               </div>
@@ -2366,11 +4213,11 @@ export default function InventoryDashboard() {
                 type="button"
                 onClick={toggleNotifAnimated}
                 aria-label="Notifications"
-                className={`tpd-click-press relative rounded-2xl border ${t.border} ${t.cardBg2} p-2.5 transition-all duration-200 ease-out motion-reduce:transition-none hover:scale-105`}
+                className={`tpd-click-press relative rounded-2xl border ${t.border} ${t.btnSecondary} p-2.5`}
               >
                 <Bell size={18} />
                 {unreadCount > 0 && (
-                  <span className="absolute -top-1 -right-1 flex h-4 min-w-4 items-center justify-center rounded-full bg-red-500 px-1 text-[10px] font-bold text-white tabular-nums">
+                  <span className="absolute -top-1 -right-1 flex h-4 min-w-4 items-center justify-center rounded-full bg-red-600 px-1 text-[10px] font-bold text-white tabular-nums">
                     {unreadCount > 9 ? '9+' : unreadCount}
                   </span>
                 )}
@@ -2379,19 +4226,19 @@ export default function InventoryDashboard() {
                 type="button"
                 onClick={openSettingsAnimated}
                 aria-label="Settings"
-                className={`tpd-click-press rounded-2xl border ${t.border} ${t.cardBg2} p-2.5 transition-all duration-200 ease-out motion-reduce:transition-none hover:scale-105`}
+                className={`tpd-click-press rounded-2xl border ${t.border} ${t.btnSecondary} p-2.5`}
               >
                 <Settings size={18} />
               </button>
-              <button onClick={() => setDarkMode(!darkMode)} className={`tpd-click-press rounded-2xl border ${t.border} ${t.cardBg2} p-2.5 transition-all duration-200 ease-out motion-reduce:transition-none hover:scale-105`}>
-                {darkMode ? <Sun size={18} className="text-yellow-300 transition-transform duration-300 ease-out motion-reduce:transition-none hover:rotate-45" /> : <Moon size={18} className="text-zinc-700 transition-transform duration-300 ease-out motion-reduce:transition-none hover:-rotate-12" />}
+              <button onClick={() => setDarkMode(!darkMode)} aria-label="Toggle theme" className={`tpd-click-press rounded-2xl border ${t.border} ${t.btnSecondary} p-2.5`}>
+                {darkMode ? <Sun size={18} className="text-yellow-300" /> : <Moon size={18} className="text-zinc-700" />}
               </button>
               <button
                 type="button"
                 onClick={handleLogout}
                 title="Sign Out"
                 aria-label="Sign Out"
-                className={`tpd-click-press rounded-2xl border ${t.border} ${t.cardBg2} p-2.5 text-red-400 transition-all duration-200 ease-out motion-reduce:transition-none hover:scale-105 hover:border-red-500/50`}
+                className={`tpd-click-press rounded-2xl border ${t.border} ${t.btnSecondary} p-2.5 ${t.dangerText}`}
               >
                 <LogOut size={18} />
               </button>
@@ -2400,18 +4247,18 @@ export default function InventoryDashboard() {
 
           <div
             ref={headerActionsRef}
-            className="grid grid-cols-2 gap-2 sm:flex sm:flex-wrap sm:items-center sm:gap-3"
+            className="grid grid-cols-2 gap-2 sm:flex sm:flex-wrap sm:items-center sm:gap-2.5"
           >
             <button
               type="button"
               onClick={toggleNotifAnimated}
               aria-label="Notifications"
               title="Notifications"
-              className={`tpd-click-press relative hidden lg:flex rounded-2xl border ${t.border} ${t.cardBg2} p-2.5 transition-all duration-200 ease-out motion-reduce:transition-none hover:scale-105`}
+              className={`tpd-click-press relative hidden lg:flex rounded-2xl border ${t.border} ${t.btnSecondary} p-2.5`}
             >
               <Bell size={18} />
               {unreadCount > 0 && (
-                <span className="absolute -top-1 -right-1 flex h-4 min-w-4 items-center justify-center rounded-full bg-red-500 px-1 text-[10px] font-bold text-white tabular-nums">
+                <span className="absolute -top-1 -right-1 flex h-4 min-w-4 items-center justify-center rounded-full bg-red-600 px-1 text-[10px] font-bold text-white tabular-nums">
                   {unreadCount > 9 ? '9+' : unreadCount}
                 </span>
               )}
@@ -2421,7 +4268,7 @@ export default function InventoryDashboard() {
               onClick={openSettingsAnimated}
               aria-label="Settings"
               title="Settings"
-              className={`group hidden lg:flex rounded-2xl border ${t.border} ${t.cardBg2} p-2.5 transition-all duration-200 ease-out motion-reduce:transition-none hover:scale-105`}
+              className={`group hidden lg:flex rounded-2xl border ${t.border} ${t.btnSecondary} p-2.5`}
             >
               <Settings size={18} className="transition-transform duration-300 ease-out motion-reduce:transition-none group-hover:rotate-45" />
             </button>
@@ -2430,25 +4277,38 @@ export default function InventoryDashboard() {
               onClick={() => setDarkMode(!darkMode)}
               title={darkMode ? 'Light Mode' : 'Dark Mode'}
               aria-label={darkMode ? 'Light Mode' : 'Dark Mode'}
-              className={`tpd-click-press hidden rounded-2xl border ${t.border} ${t.cardBg2} p-2.5 transition-all duration-200 ease-out motion-reduce:transition-none hover:scale-105 lg:block`}
+              className={`tpd-click-press hidden rounded-2xl border ${t.border} ${t.btnSecondary} p-2.5 lg:block`}
             >
-              {darkMode ? <Sun size={18} className="text-yellow-300 transition-transform duration-300 ease-out motion-reduce:transition-none hover:rotate-45" /> : <Moon size={18} className="text-zinc-700 transition-transform duration-300 ease-out motion-reduce:transition-none hover:-rotate-12" />}
+              {darkMode ? <Sun size={18} className="text-yellow-300" /> : <Moon size={18} className="text-zinc-700" />}
             </button>
             <button
               type="button"
-              onClick={openScannerAnimated}
+              onClick={() => openNewDocumentModal('INCOMING')}
+              className={`group rounded-2xl border ${t.btnSecondary} px-3.5 py-3 sm:py-2.5 text-xs sm:text-sm font-semibold flex items-center justify-center gap-1.5`}
+            >
+              <ArrowDownLeft size={15} className={t.successText} />
+              <span>Procurement</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => openNewDocumentModal('OUTGOING')}
+              className={`group rounded-2xl border ${t.btnSecondary} px-3.5 py-3 sm:py-2.5 text-xs sm:text-sm font-semibold flex items-center justify-center gap-1.5`}
+            >
+              <ArrowUpRight size={15} className={t.warnText} />
+              <span>Outgoing</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => openScannerAnimated(false)}
               title="Scan Barcode"
               aria-label="Scan Barcode"
-              className={`group rounded-2xl border ${t.btnSecondary} px-3.5 py-3 sm:py-2.5 text-xs sm:text-sm font-semibold transition-all duration-200 ease-out motion-reduce:transition-none flex items-center justify-center gap-2`}
+              className={`group rounded-2xl border ${t.btnSecondary} px-3.5 py-3 sm:py-2.5 text-xs sm:text-sm font-semibold flex items-center justify-center gap-2`}
             >
-              <BarcodeScanIcon className="h-4 w-4 transition-transform duration-200 ease-out motion-reduce:transition-none group-hover:scale-110" />
+              <BarcodeScanIcon className="h-4 w-4" />
               <span>Scan</span>
             </button>
-            <button onClick={openCreateModal} className={`group rounded-2xl border ${t.btnPrimary} px-4 py-3 sm:py-2.5 text-sm font-semibold transition-all duration-200 ease-out motion-reduce:transition-none flex items-center justify-center gap-2`}>
-              <Plus size={16} className="transition-transform duration-200 ease-out motion-reduce:transition-none group-hover:rotate-90" /> New Item
-            </button>
-            <button onClick={() => exportInventory('csv')} className={`group rounded-2xl border ${t.btnSecondary} px-3 sm:px-4 py-3 sm:py-2.5 text-xs sm:text-sm font-semibold transition-all duration-200 ease-out motion-reduce:transition-none flex items-center justify-center gap-1.5 sm:gap-2`}>
-              <Download size={15} className="transition-transform duration-200 ease-out motion-reduce:transition-none group-hover:translate-y-0.5" /> Export CSV
+            <button onClick={() => openCreateModal()} className={`group rounded-2xl border ${t.btnPrimary} px-4 py-3 sm:py-2.5 text-sm font-semibold flex items-center justify-center gap-2`}>
+              <Plus size={16} /> New Item
             </button>
             <button
               type="button"
@@ -2457,16 +4317,15 @@ export default function InventoryDashboard() {
               aria-label="Sign Out"
               className={`group hidden lg:flex rounded-2xl border ${t.btnSecondary} ${
                 isActionsCramped ? 'p-2.5' : 'px-4 py-2.5'
-              } text-sm font-semibold text-red-400 transition-all duration-200 ease-out motion-reduce:transition-none items-center justify-center gap-2`}
+              } text-sm font-semibold ${t.dangerText} items-center justify-center gap-2`}
             >
-              <LogOut size={16} className="shrink-0 transition-transform duration-200 ease-out motion-reduce:transition-none group-hover:translate-x-0.5" />
+              <LogOut size={16} className="shrink-0" />
               {!isActionsCramped && <span>Sign Out</span>}
             </button>
           </div>
 
-          {/* Notification Inbox Popover */}
           {isNotifOpen && (
-            <div className={`${isNotifClosing ? 'tpd-pop-exit' : 'tpd-pop-enter'} absolute right-3 top-full mt-2 z-40 w-full max-w-sm rounded-3xl border ${t.border} ${t.cardBg2} p-4 shadow-2xl transition-all duration-200 ease-out motion-reduce:transition-none`}>
+            <div className={`${isNotifClosing ? 'tpd-pop-exit' : 'tpd-pop-enter'} absolute right-3 top-full mt-2 z-[60] w-full max-w-sm rounded-3xl border ${t.border} ${t.modalBg} p-4 shadow-2xl`}>
               <div className={`flex items-center justify-between gap-2 pb-3 border-b ${t.border}`}>
                 <div className="flex items-center gap-2">
                   <h3 className="text-sm font-bold">Notifications</h3>
@@ -2481,7 +4340,7 @@ export default function InventoryDashboard() {
                         type="button"
                         onClick={markAllNotificationsRead}
                         title="Mark all read"
-                        className={`tpd-click-press inline-flex items-center gap-1 rounded-xl border ${t.border} ${t.inputBg} px-2 py-1 text-[11px] font-medium ${t.textMuted} hover:text-white`}
+                        className={`tpd-click-press inline-flex items-center gap-1 rounded-xl border ${t.border} ${t.btnSecondary} px-2 py-1 text-[11px] font-medium`}
                       >
                         <CheckCheck size={12} />
                         <span>Read</span>
@@ -2490,7 +4349,7 @@ export default function InventoryDashboard() {
                         type="button"
                         onClick={clearNotifications}
                         title="Clear notifications"
-                        className={`tpd-click-press rounded-xl border ${t.border} ${t.inputBg} px-2 py-1 text-[11px] font-medium text-red-400 hover:bg-red-950/50`}
+                        className={`tpd-click-press rounded-xl border ${t.btnDangerSubtle} px-2 py-1 text-[11px] font-semibold`}
                       >
                         Clear
                       </button>
@@ -2499,7 +4358,8 @@ export default function InventoryDashboard() {
                   <button
                     type="button"
                     onClick={closeNotifAnimated}
-                    className={`tpd-click-press rounded-xl border ${t.border} ${t.inputBg} p-1 ${t.textMuted}`}
+                    aria-label="Close notifications"
+                    className={`tpd-click-press rounded-xl border ${t.border} ${t.btnSecondary} p-1`}
                   >
                     <X size={13} />
                   </button>
@@ -2509,7 +4369,7 @@ export default function InventoryDashboard() {
               <div className="mt-3 max-h-72 space-y-2 overflow-y-auto pr-1">
                 {notifications.length === 0 ? (
                   <p className={`py-6 text-center text-xs ${t.textMuted}`}>
-                    No notifications yet. Low stock, scans, and staff updates will appear here.
+                    No notifications yet.
                   </p>
                 ) : (
                   notifications.map((entry) => (
@@ -2526,7 +4386,7 @@ export default function InventoryDashboard() {
                     >
                       <div className="flex items-center justify-between gap-2">
                         <p className="text-xs font-bold truncate">
-                          {!entry.read && <span className="mr-1.5 inline-block h-2 w-2 rounded-full bg-emerald-400" />}
+                          {!entry.read && <span className="mr-1.5 inline-block h-2 w-2 rounded-full bg-emerald-500" />}
                           {entry.title}
                         </p>
                         <span className={`text-[10px] ${t.textMuted2} shrink-0 tabular-nums`}>{entry.time}</span>
@@ -2540,135 +4400,96 @@ export default function InventoryDashboard() {
           )}
         </header>
 
-        <section className="grid grid-cols-2 gap-3 sm:grid-cols-2 xl:grid-cols-4">
+        <section className="grid grid-cols-2 gap-3 sm:grid-cols-3 xl:grid-cols-6">
           {[
             { label: 'Total Items', value: items.length, icon: Package2 },
             { label: 'Inventory Value', value: `₱${totalValue.toLocaleString()}`, icon: TrendingUp },
-            { label: 'Low Stock', value: lowStockCount, icon: Box },
+            { label: 'Procurement', value: `+${totalIncomingUnits}`, icon: ArrowDownLeft },
+            { label: 'Outgoing', value: `-${totalOutgoingUnits}`, icon: ShoppingBag },
+            { label: 'Low / Out', value: lowStockCount, icon: Box },
             { label: 'Categories', value: categories.length, icon: Warehouse },
           ].map((card) => (
             <div key={card.label} className={`group rounded-3xl border ${t.border} ${t.cardBg2} p-4 sm:p-5 transition-all duration-200 ease-out motion-reduce:transition-none hover:-translate-y-0.5 hover:shadow-xl`}>
-              <div className="flex items-center justify-between">
-                <p className={`text-xs sm:text-sm ${t.textMuted}`}>{card.label}</p>
-                <card.icon className={`h-4 w-4 sm:h-5 sm:w-5 ${iconClass} transition-transform duration-200 ease-out motion-reduce:transition-none group-hover:scale-110`} />
+              <div className="flex items-center justify-between gap-1.5">
+                <p className={`text-xs sm:text-sm ${t.textMuted} truncate`}>{card.label}</p>
+                <card.icon className={`h-4 w-4 sm:h-5 sm:w-5 ${iconClass} shrink-0`} />
               </div>
-              <p className="mt-3 sm:mt-4 text-xl sm:text-3xl font-black tabular-nums truncate">{card.value}</p>
+              <p className="mt-3 sm:mt-4 text-xl sm:text-2xl xl:text-3xl font-black tabular-nums truncate">{card.value}</p>
             </div>
           ))}
         </section>
 
-        {/* Stock by category & Recent audit activity */}
-        <section
-          className={
-            isChartMaximized || isAuditMaximized
-              ? 'grid gap-6 grid-cols-1'
-              : 'grid gap-6 xl:grid-cols-[1.15fr_0.85fr]'
-          }
-        >
-          {!isAuditMaximized && (
-            <div
-              className={`${
-                isChartMaximized
-                  ? 'fixed inset-4 z-40 overflow-y-auto shadow-2xl'
-                  : 'overflow-hidden'
-              } rounded-3xl border ${t.border} ${t.cardBg2} p-4 sm:p-5 transition-all duration-200 ease-out motion-reduce:transition-none hover:shadow-xl`}
-            >
-              <div className={`flex items-center justify-between gap-2 ${isSectionMinimized ? '' : 'mb-4'}`}>
-                <div>
-                  <h2 className="text-lg sm:text-xl font-bold">Stock by category</h2>
-                  <p className={`text-xs sm:text-sm ${t.textMuted}`}>Visual snapshot of inventory depth</p>
-                </div>
-                <div className="flex items-center gap-1.5 shrink-0">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      if (isChartMaximized) {
-                        setIsChartMaximized(false);
-                        setIsSectionMinimized(false);
-                      } else {
-                        setIsSectionMinimized((prev) => !prev);
-                      }
-                    }}
-                    title={isSectionMinimized ? 'Restore both sections' : 'Minimize both sections'}
-                    aria-label={isSectionMinimized ? 'Restore both sections' : 'Minimize both sections'}
-                    className={`tpd-click-press rounded-xl border ${t.border} ${t.cardBg3} p-2 ${t.textMuted} hover:text-white shrink-0`}
-                  >
-                    <Minimize2 size={14} />
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setIsSectionMinimized(false);
-                      setIsChartMaximized((prev) => !prev);
-                    }}
-                    title={isChartMaximized ? 'Exit fullscreen Stock by category' : 'Maximize Stock by category'}
-                    aria-label={isChartMaximized ? 'Exit fullscreen Stock by category' : 'Maximize Stock by category'}
-                    className={`tpd-click-press rounded-xl border ${t.border} ${t.cardBg3} p-2 ${t.textMuted} hover:text-white shrink-0`}
-                  >
-                    <Maximize2 size={14} />
-                  </button>
-                </div>
+        <section className="grid gap-6 grid-cols-1">
+          <div
+            className={`${
+              isAuditMaximized
+                ? 'fixed inset-4 z-40 overflow-y-auto shadow-2xl'
+                : ''
+            } rounded-3xl border ${t.border} ${t.cardBg2} p-4 sm:p-5`}
+          >
+            <div className={`flex items-center justify-between gap-2 ${isSectionMinimized ? '' : 'mb-4'}`}>
+              <div>
+                <h2 className="text-lg sm:text-xl font-bold">Recent audit activity</h2>
+                <p className={`text-xs sm:text-sm ${t.textMuted}`}>Procurement, outgoing orders, and item updates</p>
               </div>
-
-              {!isSectionMinimized && (
-                <div className={`${isChartMaximized ? 'h-[65vh]' : 'h-64 sm:h-72'} w-full min-w-0`}>
-                  <ResponsiveContainer width="100%" height="100%">
-                    <BarChart data={chartData} margin={{ top: 10, right: 10, left: -25, bottom: 0 }}>
-                      <CartesianGrid strokeDasharray="3 3" stroke={t.chartStroke} vertical={false} />
-                      <XAxis dataKey="category" stroke={t.chartAxis} fontSize={11} tickLine={false} />
-                      <YAxis stroke={t.chartAxis} fontSize={11} tickLine={false} />
-                      <Tooltip
-                        contentStyle={{ backgroundColor: darkMode ? '#18181b' : '#ffffff', border: `1px solid ${darkMode ? '#27272a' : '#d4d4d8'}`, color: darkMode ? '#ffffff' : '#000000', borderRadius: '12px' }}
-                      />
-                      <Bar dataKey="stock" fill={darkMode ? '#ffffff' : '#000000'} radius={[8, 8, 0, 0]} maxBarSize={48} />
-                    </BarChart>
-                  </ResponsiveContainer>
-                </div>
-              )}
+              <div className="flex items-center gap-1.5 shrink-0">
+                <div className={`rounded-full border ${t.border} ${t.cardBg3} px-3 py-1 text-xs sm:text-sm tabular-nums ${t.textMuted}`}>{auditLog.length}</div>
+                <button
+                  type="button"
+                  onClick={() => setIsSectionMinimized((prev) => !prev)}
+                  title={isSectionMinimized ? 'Expand' : 'Minimize'}
+                  aria-label={isSectionMinimized ? 'Expand' : 'Minimize'}
+                  className={`tpd-click-press rounded-xl border ${t.border} ${t.btnSecondary} p-2`}
+                >
+                  <Minimize2 size={14} />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setIsSectionMinimized(false);
+                    setIsAuditMaximized((prev) => !prev);
+                  }}
+                  title={isAuditMaximized ? 'Exit fullscreen' : 'Maximize'}
+                  aria-label={isAuditMaximized ? 'Exit fullscreen' : 'Maximize'}
+                  className={`tpd-click-press rounded-xl border ${t.border} ${t.btnSecondary} p-2`}
+                >
+                  <Maximize2 size={14} />
+                </button>
+              </div>
             </div>
-          )}
 
-          {!isChartMaximized && (
-            <div
-              className={`${
-                isAuditMaximized
-                  ? 'fixed inset-4 z-40 overflow-y-auto shadow-2xl'
-                  : ''
-              } rounded-3xl border ${t.border} ${t.cardBg2} p-4 sm:p-5 transition-all duration-200 ease-out motion-reduce:transition-none hover:shadow-xl`}
-            >
-              <div className={`flex items-center justify-between gap-2 ${isSectionMinimized ? '' : 'mb-4'}`}>
-                <div>
-                  <h2 className="text-lg sm:text-xl font-bold">Recent audit activity</h2>
-                  <p className={`text-xs sm:text-sm ${t.textMuted}`}>Latest inventory events</p>
-                </div>
-                <div className="flex items-center gap-1.5 shrink-0">
-                  <div className={`rounded-full border ${t.border} px-3 py-1 text-xs sm:text-sm tabular-nums ${t.textMuted}`}>{auditLog.length} updates</div>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setIsSectionMinimized(false);
-                      setIsAuditMaximized((prev) => !prev);
-                    }}
-                    title={isAuditMaximized ? 'Exit fullscreen Recent audit activity' : 'Maximize Recent audit activity'}
-                    aria-label={isAuditMaximized ? 'Exit fullscreen Recent audit activity' : 'Maximize Recent audit activity'}
-                    className={`tpd-click-press rounded-xl border ${t.border} ${t.cardBg3} p-2 ${t.textMuted} hover:text-white`}
-                  >
-                    <Maximize2 size={14} />
-                  </button>
-                </div>
-              </div>
-
-              {!isSectionMinimized && (
-                <div className={`space-y-3 ${isAuditMaximized ? 'max-h-[70vh]' : 'max-h-72'} overflow-y-auto pr-1`}>
-                  {auditLog.length === 0 ? (
-                    <p className={`text-sm ${t.textMuted} py-6 text-center`}>No audit events recorded yet.</p>
-                  ) : (
-                    auditLog.map((entry) => (
-                      <div key={entry.id} className={`flex items-center justify-between gap-3 rounded-2xl border ${t.border} ${t.cardBg3} p-3 transition-all duration-200 ease-out motion-reduce:transition-none hover:translate-x-0.5`}>
+            {!isSectionMinimized && (
+              <div className={`space-y-3 ${isAuditMaximized ? 'max-h-[70vh]' : 'max-h-72'} overflow-y-auto pr-1`}>
+                {auditLog.length === 0 ? (
+                  <p className={`text-sm ${t.textMuted} py-6 text-center`}>No audit events yet.</p>
+                ) : (
+                  auditLog.map((entry) => {
+                    const parsed = parseMovementMeta(entry.detail || '', entry.action || '');
+                    const dir = entry.direction || parsed.direction;
+                    const meta = entry.meta || parsed.meta;
+                    return (
+                      <div key={entry.id} className={`flex items-center justify-between gap-3 rounded-2xl border ${t.border} ${t.cardBg3} p-3`}>
                         <div className="min-w-0 flex-1">
-                          <p className="font-semibold text-xs sm:text-sm truncate">{entry.item}</p>
+                          <div className="flex flex-wrap items-center gap-2">
+                            <p className="font-semibold text-xs sm:text-sm truncate">{entry.item}</p>
+                            {dir === 'INCOMING' && (
+                              <span className={`rounded-full border px-2 py-0.5 text-[10px] font-bold shrink-0 ${t.incomingBadge}`}>
+                                PROCUREMENT
+                              </span>
+                            )}
+                            {dir === 'OUTGOING' && (
+                              <span className={`rounded-full border px-2 py-0.5 text-[10px] font-bold shrink-0 ${t.outgoingBadge}`}>
+                                OUTGOING
+                              </span>
+                            )}
+                            {typeof meta?.previousStock === 'number' && typeof meta?.newStock === 'number' && (
+                              <span className={`rounded-full border ${t.badgeBg} px-2 py-0.5 text-[10px] font-semibold tabular-nums`}>
+                                {meta.previousStock} → {meta.newStock}
+                              </span>
+                            )}
+                          </div>
                           <p className={`text-[11px] sm:text-xs ${t.textMuted} truncate`}>{entry.detail}</p>
-                          {entry.user && <p className="mt-0.5 text-[10px] font-medium text-emerald-400 truncate">By: {entry.user}</p>}
+                          {entry.user && <p className={`mt-0.5 text-[10px] font-medium ${t.successText} truncate`}>By: {entry.user}</p>}
                         </div>
                         <div className="flex items-center gap-2 shrink-0">
                           <div className={`text-right text-[11px] sm:text-xs ${t.textMuted2}`}>
@@ -2677,21 +4498,21 @@ export default function InventoryDashboard() {
                           </div>
                           <button
                             type="button"
-                            onClick={() => deleteAuditLog(entry.id)}
+                            onClick={() => void deleteAuditLog(entry.id)}
                             title="Delete audit log"
                             aria-label="Delete audit log"
-                            className={`tpd-click-press rounded-xl border ${t.border} p-1.5 text-red-400 transition-all duration-150 hover:scale-110 hover:bg-red-950/60`}
+                            className={`tpd-click-press rounded-xl border ${t.border} ${t.btnSecondary} p-1.5 ${t.dangerText}`}
                           >
                             <Trash2 size={13} />
                           </button>
                         </div>
                       </div>
-                    ))
-                  )}
-                </div>
-              )}
-            </div>
-          )}
+                    );
+                  })
+                )}
+              </div>
+            )}
+          </div>
         </section>
 
         <section className="grid gap-6 xl:grid-cols-[1.4fr_0.6fr]">
@@ -2699,10 +4520,10 @@ export default function InventoryDashboard() {
             <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
               <div>
                 <h2 className="text-xl sm:text-2xl font-black">Inventory overview</h2>
-                <p className={`text-sm ${t.textMuted}`}>Responsive table with database sync &bull; Press <kbd className="rounded border border-zinc-700 px-1.5 py-0.5 text-[11px]">/</kbd> to search or <kbd className="rounded border border-zinc-700 px-1.5 py-0.5 text-[11px]">Enter</kbd> for quick match</p>
+                <p className={`text-sm ${t.textMuted}`}>Synced table &bull; Press <kbd className={`rounded border ${t.border} ${t.cardBg3} px-1.5 py-0.5 text-[11px]`}>/</kbd> or <kbd className={`rounded border ${t.border} ${t.cardBg3} px-1.5 py-0.5 text-[11px]`}>Enter</kbd> to search</p>
               </div>
               <div className="flex flex-col gap-2.5 sm:flex-row sm:flex-wrap sm:items-center">
-                <label className={`flex items-center gap-2 rounded-2xl border ${t.border} ${t.cardBg3} px-3 py-2 transition-colors duration-200 ease-out focus-within:border-zinc-500`}>
+                <label className={`flex items-center gap-2 rounded-2xl border ${t.border} ${t.inputBg} px-3 py-2`}>
                   <Search size={16} className={iconClass} />
                   <input
                     ref={searchInputRef}
@@ -2721,17 +4542,17 @@ export default function InventoryDashboard() {
                         }
                       }
                     }}
-                    placeholder="Search or scan SKU + Enter"
-                    className={`w-full bg-transparent text-base sm:text-sm outline-none sm:w-48 ${t.text}`}
+                    placeholder="Search or scan SKU"
+                    className={`w-full bg-transparent text-base sm:text-sm outline-none sm:w-44 ${t.text}`}
                   />
                 </label>
                 <button
                   type="button"
-                  onClick={openScannerAnimated}
+                  onClick={() => openScannerAnimated(false)}
                   title="Scan Barcode"
-                  className={`group inline-flex items-center justify-center gap-2 rounded-2xl border ${t.btnSecondary} px-3.5 py-2 text-sm font-semibold transition-all duration-200 ease-out motion-reduce:transition-none`}
+                  className={`group inline-flex items-center justify-center gap-2 rounded-2xl border ${t.btnSecondary} px-3.5 py-2 text-sm font-semibold`}
                 >
-                  <BarcodeScanIcon className="h-4 w-4 transition-transform duration-200 ease-out motion-reduce:transition-none group-hover:scale-110" />
+                  <BarcodeScanIcon className="h-4 w-4" />
                   <span>Scan</span>
                 </button>
                 <CascadeSelect
@@ -2739,20 +4560,20 @@ export default function InventoryDashboard() {
                   onChange={setStatusFilter}
                   options={statusOptions}
                   darkMode={darkMode}
-                  minWidthClass="min-w-[140px]"
+                  minWidthClass="min-w-[145px]"
                 />
                 <CascadeSelect
                   value={categoryFilter}
                   onChange={setCategoryFilter}
                   options={categoryFilterOptions}
                   darkMode={darkMode}
-                  minWidthClass="min-w-[175px]"
+                  minWidthClass="min-w-[165px]"
                 />
                 {hasActiveFilters && (
                   <button
                     type="button"
                     onClick={resetFilters}
-                    className={`tpd-click-press inline-flex items-center justify-center gap-1.5 rounded-2xl border ${t.border} ${t.cardBg3} px-3 py-2 text-xs font-semibold ${t.textMuted} transition-colors duration-150 hover:text-white`}
+                    className={`tpd-click-press inline-flex items-center justify-center gap-1.5 rounded-2xl border ${t.border} ${t.btnSecondary} px-3 py-2 text-xs font-semibold`}
                   >
                     <RotateCcw size={13} />
                     <span>Reset</span>
@@ -2764,57 +4585,135 @@ export default function InventoryDashboard() {
             {lastScannedSummary && (
               <div className={`mt-4 flex flex-wrap items-center justify-between gap-2 rounded-2xl border ${t.border} ${t.cardBg3} px-3.5 py-2 text-xs`}>
                 <div className="flex items-center gap-2 min-w-0">
-                  <span className="h-2 w-2 rounded-full bg-emerald-400 shrink-0" />
+                  <span className="h-2 w-2 rounded-full bg-emerald-500 shrink-0" />
                   <span className={t.textMuted}>Last scan:</span>
                   <strong className="truncate">{lastScannedSummary}</strong>
                 </div>
                 <button
                   type="button"
                   onClick={() => setLastScannedSummary(null)}
-                  className={`text-[11px] ${t.textMuted2} hover:text-white`}
+                  className={`text-[11px] ${t.textMuted2}`}
                 >
                   Dismiss
                 </button>
               </div>
             )}
 
-            <div className={`mt-6 flex flex-wrap items-center justify-between gap-3 border-b ${t.border} pb-3 text-sm`}>
-              <div className="flex gap-2">
-                <button onClick={() => setActiveTab('inventory')} className={`rounded-full px-4 py-1.5 font-medium transition-all duration-200 ease-out motion-reduce:transition-none ${activeTab === 'inventory' ? t.tabActive : t.tabInactive}`}>Inventory</button>
-                <button onClick={() => setActiveTab('audit')} className={`rounded-full px-4 py-1.5 font-medium transition-all duration-200 ease-out motion-reduce:transition-none ${activeTab === 'audit' ? t.tabActive : t.tabInactive}`}>Audit Log ({auditLog.length})</button>
+            <div className={`mt-6 flex flex-col gap-3 border-b ${t.border} pb-3 text-sm`}>
+              <div className="flex flex-wrap gap-2">
+                <button onClick={() => setActiveTab('inventory')} className={`rounded-full px-4 py-1.5 font-medium ${activeTab === 'inventory' ? t.tabActive : t.tabInactive}`}>Inventory</button>
+                <button onClick={() => setActiveTab('incoming')} className={`rounded-full px-4 py-1.5 font-medium ${activeTab === 'incoming' ? t.tabActive : t.tabInactive}`}>
+                  Procurement ({pendingIncomingCount})
+                </button>
+                <button onClick={() => setActiveTab('outgoing')} className={`rounded-full px-4 py-1.5 font-medium ${activeTab === 'outgoing' ? t.tabActive : t.tabInactive}`}>
+                  Outgoing ({pendingOutgoingCount})
+                </button>
+                <button onClick={() => setActiveTab('audit')} className={`rounded-full px-4 py-1.5 font-medium ${activeTab === 'audit' ? t.tabActive : t.tabInactive}`}>
+                  Audit Log ({auditLog.length})
+                </button>
               </div>
 
               {activeTab === 'inventory' && (
-                <div className={`inline-flex items-center gap-1 rounded-full border p-0.5 text-xs ${t.border} ${t.cardBg3}`}>
+                <div className="flex flex-wrap items-center gap-2">
                   <button
                     type="button"
-                    onClick={() => setLabelFormat('compact')}
-                    className={`rounded-full px-3 py-1 font-semibold transition-all duration-150 ${
-                      labelFormat === 'compact' ? t.tabActive : `${t.textMuted} hover:text-white`
+                    onClick={() => {
+                      setBarcodeSelectMode((prev) => {
+                        if (prev) setSelectedBarcodeItemIds(new Set());
+                        return !prev;
+                      });
+                    }}
+                    className={`tpd-click-press inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-semibold ${
+                      barcodeSelectMode ? t.tabActive : t.tabInactive
                     }`}
                   >
-                    Compact Label
+                    <Printer size={12} />
+                    <span>{barcodeSelectMode ? 'Done' : 'Multi-Print'}</span>
                   </button>
-                  <button
-                    type="button"
-                    onClick={() => setLabelFormat('full')}
-                    className={`rounded-full px-3 py-1 font-semibold transition-all duration-150 ${
-                      labelFormat === 'full' ? t.tabActive : `${t.textMuted} hover:text-white`
-                    }`}
-                  >
-                    Full Label
-                  </button>
+
+                  {barcodeSelectMode && (
+                    <>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          if (selectedBarcodeItemIds.size === printableFilteredItems.length && printableFilteredItems.length > 0) {
+                            setSelectedBarcodeItemIds(new Set());
+                          } else {
+                            setSelectedBarcodeItemIds(new Set(printableFilteredItems.map((entry) => entry.id)));
+                          }
+                        }}
+                        className={`tpd-click-press rounded-full border ${t.tabInactive} px-3 py-1 text-xs font-semibold`}
+                      >
+                        {selectedBarcodeItemIds.size === printableFilteredItems.length && printableFilteredItems.length > 0
+                          ? 'Deselect All'
+                          : 'Select All'}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={printSelectedBarcodes}
+                        disabled={selectedPrintableCount === 0}
+                        className={`tpd-click-press inline-flex items-center gap-1.5 rounded-full border ${t.btnPrimary} px-3.5 py-1 text-xs font-bold disabled:opacity-40 tabular-nums`}
+                      >
+                        <Printer size={12} />
+                        <span>Print ({selectedPrintableCount})</span>
+                      </button>
+                    </>
+                  )}
+
+                  <div className={`inline-flex items-center gap-1 rounded-full border p-0.5 text-xs ${t.border} ${t.cardBg3}`}>
+                    <button
+                      type="button"
+                      onClick={() => setInventoryViewMode('grouped')}
+                      className={`inline-flex items-center gap-1 rounded-full px-3 py-1 font-semibold ${
+                        inventoryViewMode === 'grouped' ? t.tabActive : t.textMuted
+                      }`}
+                    >
+                      <Layers size={12} />
+                      <span>Group</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setInventoryViewMode('list')}
+                      className={`inline-flex items-center gap-1 rounded-full px-3 py-1 font-semibold ${
+                        inventoryViewMode === 'list' ? t.tabActive : t.textMuted
+                      }`}
+                    >
+                      <List size={12} />
+                      <span>List</span>
+                    </button>
+                  </div>
+
+                  <div className={`inline-flex items-center gap-1 rounded-full border p-0.5 text-xs ${t.border} ${t.cardBg3}`}>
+                    <button
+                      type="button"
+                      onClick={() => setLabelFormat('compact')}
+                      className={`rounded-full px-3 py-1 font-semibold ${
+                        labelFormat === 'compact' ? t.tabActive : t.textMuted
+                      }`}
+                    >
+                      Compact
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setLabelFormat('full')}
+                      className={`rounded-full px-3 py-1 font-semibold ${
+                        labelFormat === 'full' ? t.tabActive : t.textMuted
+                      }`}
+                    >
+                      Full
+                    </button>
+                  </div>
                 </div>
               )}
             </div>
 
             {activeTab === 'inventory' ? (
-              <div className="mt-5 space-y-3">
+              <div className="mt-5 space-y-4">
                 {filteredItems.length === 0 ? (
                   <div className={`rounded-2xl border border-dashed ${t.border} ${t.cardBg3} py-10 px-4 text-center`}>
                     <p className="text-sm font-bold">No items found</p>
                     <p className={`mt-1 text-xs ${t.textMuted}`}>
-                      {hasActiveFilters ? 'Try clearing or resetting your active filters.' : 'Add a new item to start tracking stock.'}
+                      {hasActiveFilters ? 'Clear or reset your filters.' : 'Add an item to get started.'}
                     </p>
                     {hasActiveFilters && (
                       <button
@@ -2823,205 +4722,138 @@ export default function InventoryDashboard() {
                         className={`mt-3 inline-flex items-center gap-1.5 rounded-2xl border ${t.btnPrimary} px-3.5 py-1.5 text-xs font-semibold`}
                       >
                         <RotateCcw size={12} />
-                        <span>Reset Filters</span>
+                        <span>Reset</span>
                       </button>
                     )}
                   </div>
-                ) : (
-                  filteredItems.map((item) => {
-                    const isExpanded = Boolean(expandedBarcodes[item.id]);
-                    const isPulsed = Boolean(pulsedItemIds[item.id]);
-                    const customQty = Math.max(1, Number(customCardQty[item.id]) || 5);
-                    const copiesCount = getItemPrintCopies(item.id);
-                    const barcodeItemSizeLabel = formatBarcodeItemSizeLabel(item.name, item.size);
-
+                ) : inventoryViewMode === 'grouped' ? (
+                  groupedFilteredItems.map((group) => {
+                    const isCollapsed = Boolean(collapsedGroups[group.category]);
                     return (
                       <div
-                        key={item.id}
-                        className={`rounded-2xl border p-3.5 sm:p-4 transition-all duration-200 ease-out motion-reduce:transition-none hover:-translate-y-0.5 hover:shadow-lg ${
-                          isPulsed ? 'border-emerald-500/70 ring-2 ring-emerald-500/20' : t.border
-                        } ${t.cardBgHover}`}
+                        key={group.category}
+                        className={`rounded-3xl border ${t.border} ${t.cardBg3} p-3.5 sm:p-4`}
                       >
-                        <div className="flex items-start justify-between gap-2">
-                          <div className="min-w-0 flex-1">
-                            <p className="font-semibold text-sm sm:text-base truncate">{item.name}</p>
-                            <p className={`text-xs ${t.textMuted2} truncate`}>{item.sku} &bull; {item.size}</p>
-                          </div>
-                          <div className="flex items-center gap-2 shrink-0">
-                            <span className={`rounded-full border ${t.badgeBg} px-2 py-0.5 text-[11px]`}>{item.category}</span>
-                            <span className={`rounded-full px-2.5 py-0.5 text-[11px] font-semibold transition-transform duration-200 ease-out motion-reduce:transition-none hover:scale-105 ${item.status === 'LOW' ? t.lowBg : t.okBg}`}>{item.status}</span>
-                          </div>
-                        </div>
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <button
+                            type="button"
+                            onClick={() => toggleGroupCollapse(group.category)}
+                            className="flex items-center gap-2.5 text-left min-w-0 flex-1"
+                          >
+                            <span className={`flex h-7 w-7 shrink-0 items-center justify-center rounded-xl border ${t.border} ${t.cardBg2}`}>
+                              {isCollapsed ? <ChevronDown size={15} /> : <ChevronUp size={15} />}
+                            </span>
+                            <div className="min-w-0">
+                              <div className="flex flex-wrap items-center gap-2">
+                                <h3 className="text-base sm:text-lg font-black uppercase tracking-wide truncate">
+                                  {group.category}
+                                </h3>
+                                <span className={`rounded-full border ${t.badgeBg} px-2.5 py-0.5 text-[11px] font-semibold tabular-nums`}>
+                                  {group.items.length} {group.items.length === 1 ? 'item' : 'items'}
+                                </span>
+                                <span className={`rounded-full border ${t.badgeBg} px-2.5 py-0.5 text-[11px] font-semibold tabular-nums`}>
+                                  {group.totalStock} stock
+                                </span>
+                                {group.lowCount > 0 && (
+                                  <span className={`rounded-full border px-2.5 py-0.5 text-[11px] font-bold tabular-nums ${t.lowBg}`}>
+                                    {group.lowCount} low
+                                  </span>
+                                )}
+                              </div>
 
-                        <div className="mt-3 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-                          <div className="flex-1">
-                            <div className="flex justify-between text-xs mb-1 tabular-nums">
-                              <span className={t.textMuted}>
-                                Stock:{' '}
-                                <strong className={`inline-block transition-transform duration-200 ease-out motion-reduce:transition-none ${isPulsed ? 'scale-110 text-emerald-400' : t.text}`}>
-                                  {item.stock}
-                                </strong>
-                              </span>
-                              <span className={t.textMuted}>Min: {item.min}</span>
-                            </div>
-                            <div className={`h-2 w-full rounded-full overflow-hidden ${t.progressBg}`}>
-                              <div className={`h-2 rounded-full transition-all duration-300 ease-out motion-reduce:transition-none ${t.progressFill}`} style={{ width: `${Math.min(100, (item.stock / Math.max(item.min, 1)) * 100)}%` }} />
-                            </div>
-                          </div>
-
-                          <div className="flex flex-wrap items-center gap-1.5 shrink-0">
-                            <button onClick={() => adjustStock(item.id, -5, 'button')} title="Deduct 5" className={`tpd-click-press rounded-full border ${t.border} px-2 py-1 text-[11px] font-semibold transition-all duration-150 hover:scale-105 hover:bg-zinc-800 hover:text-white tabular-nums`}>-5</button>
-                            <button onClick={() => adjustStock(item.id, -1, 'button')} title="Deduct 1" className={`tpd-click-press rounded-full border ${t.border} px-2.5 py-1 text-xs font-semibold transition-all duration-150 hover:scale-110 hover:bg-zinc-800 hover:text-white`}>-</button>
-                            <button onClick={() => adjustStock(item.id, 1, 'button')} title="Add 1" className={`tpd-click-press rounded-full border ${t.border} px-2.5 py-1 text-xs font-semibold transition-all duration-150 hover:scale-110 hover:bg-zinc-800 hover:text-white`}>+</button>
-                            <button onClick={() => adjustStock(item.id, 5, 'button')} title="Add 5" className={`tpd-click-press rounded-full border ${t.border} px-2 py-1 text-[11px] font-semibold transition-all duration-150 hover:scale-105 hover:bg-zinc-800 hover:text-white tabular-nums`}>+5</button>
-                            <button onClick={() => adjustStock(item.id, 10, 'button')} title="Add 10" className={`tpd-click-press rounded-full border ${t.border} px-2 py-1 text-[11px] font-semibold transition-all duration-150 hover:scale-105 hover:bg-zinc-800 hover:text-white tabular-nums`}>+10</button>
-
-                            <div className={`inline-flex items-center rounded-full border ${t.border} ${t.inputBg} pl-1.5 pr-1 py-0.5`}>
-                              <input
-                                type="number"
-                                min={1}
-                                value={customQty}
-                                onChange={(e) => {
-                                  const parsed = parseInt(e.target.value, 10);
-                                  setCustomCardQty((prev) => ({
-                                    ...prev,
-                                    [item.id]: Number.isNaN(parsed) ? 1 : Math.max(1, parsed),
-                                  }));
-                                }}
-                                aria-label={`Custom quantity for ${item.name}`}
-                                className={`w-10 bg-transparent text-center text-[11px] font-bold tabular-nums outline-none ${t.text}`}
-                              />
-                              <button
-                                type="button"
-                                onClick={() => adjustStock(item.id, customQty, 'button')}
-                                title={`Add ${customQty} units`}
-                                className={`tpd-click-press rounded-full border ${t.btnPrimary} px-2 py-0.5 text-[10px] font-bold tabular-nums`}
-                              >
-                                +{customQty}
-                              </button>
-                            </div>
-
-                            <button
-                              type="button"
-                              onClick={() => openDuplicateModal(item)}
-                              title="Duplicate item for variant"
-                              aria-label="Duplicate item"
-                              className={`tpd-click-press rounded-full border ${t.border} p-1.5 transition-all duration-150 hover:scale-110 hover:bg-zinc-800 hover:text-white`}
-                            >
-                              <Copy size={13} />
-                            </button>
-                            <button onClick={() => openEditModal(item)} title="Edit item" aria-label="Edit item" className={`tpd-click-press rounded-full border ${t.border} p-1.5 transition-all duration-150 hover:scale-110 hover:bg-zinc-800 hover:text-white`}><Edit3 size={13} /></button>
-                            <button onClick={() => deleteItem(item.id)} title="Delete item" aria-label="Delete item" className={`tpd-click-press rounded-full border ${t.border} p-1.5 text-red-400 transition-all duration-150 hover:scale-110 hover:bg-red-950/60`}><Trash2 size={13} /></button>
-                          </div>
-                        </div>
-
-                        {(item.colors || []).length > 0 && (
-                          <div className="mt-3 flex flex-wrap gap-1.5 pt-2 border-t border-zinc-800/40">
-                            {(item.colors || []).map((color) => (
-                              <span key={color} className={`group flex items-center gap-2 rounded-full border ${t.badgeBg} px-2.5 py-0.5 text-[11px] transition-transform duration-150 ease-out motion-reduce:transition-none hover:scale-105`}>
-                                <ColorCircle color={color} size="sm" />
-                                <span>{color}</span>
-                              </span>
-                            ))}
-                          </div>
-                        )}
-
-                        {item.sku && (
-                          <div className="mt-3 pt-2 border-t border-zinc-800/40">
-                            <div className="flex flex-wrap items-center justify-between gap-2">
-                              <button
-                                type="button"
-                                onClick={() => toggleBarcodeExpand(item.id)}
-                                className={`tpd-click-press inline-flex items-center gap-1.5 rounded-xl border ${t.border} ${t.cardBg3} px-2.5 py-1 text-[11px] font-medium ${t.textMuted} transition-all duration-150 ease-out motion-reduce:transition-none hover:scale-105`}
-                              >
-                                {isExpanded ? <ChevronUp size={13} /> : <ChevronDown size={13} />}
-                                <span>{isExpanded ? 'Minimize Barcode' : 'Show Barcode'}</span>
-                              </button>
-
-                              <div className="flex flex-wrap items-center gap-1.5">
-                                <div className={`inline-flex items-center gap-1 rounded-xl border ${t.border} ${t.cardBg3} px-2 py-0.5 text-[11px]`}>
-                                  <span className={t.textMuted}>Copies</span>
-                                  <input
-                                    type="number"
-                                    min={1}
-                                    max={100}
-                                    value={copiesCount}
-                                    onChange={(e) => setItemPrintCopies(item.id, parseInt(e.target.value, 10))}
-                                    aria-label={`Print copies for ${item.name}`}
-                                    className={`w-10 bg-transparent text-center font-bold tabular-nums outline-none ${t.text}`}
-                                  />
-                                  {[1, 5, 10].map((preset) => (
-                                    <button
-                                      key={preset}
-                                      type="button"
-                                      onClick={() => setItemPrintCopies(item.id, preset)}
-                                      className={`rounded-md px-1 py-0.5 text-[10px] font-semibold tabular-nums transition-colors ${
-                                        copiesCount === preset ? t.tabActive : `${t.textMuted} hover:text-white`
-                                      }`}
+                              {group.allColors.length > 0 && (
+                                <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+                                  {group.allColors.map((color) => (
+                                    <span
+                                      key={color}
+                                      className={`inline-flex items-center gap-1 rounded-full border ${t.badgeBg} px-2 py-0.5 text-[10px]`}
                                     >
-                                      {preset}
-                                    </button>
+                                      <ColorCircle color={color} size="sm" />
+                                      <span>{color}</span>
+                                    </span>
                                   ))}
                                 </div>
-                                <button
-                                  type="button"
-                                  onClick={() => downloadBarcodePng(item)}
-                                  className={`inline-flex items-center gap-1.5 rounded-xl border ${t.btnSecondary} px-2.5 py-1 text-[11px] font-semibold transition-all duration-200 ease-out motion-reduce:transition-none`}
-                                >
-                                  <Download size={12} />
-                                  <span>Download</span>
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={() => printBarcodeLabel(item, copiesCount)}
-                                  className={`inline-flex items-center gap-1.5 rounded-xl border ${t.btnSecondary} px-2.5 py-1 text-[11px] font-semibold transition-all duration-200 ease-out motion-reduce:transition-none tabular-nums`}
-                                >
-                                  <Printer size={12} />
-                                  <span>Print ({copiesCount})</span>
-                                </button>
-                              </div>
+                              )}
                             </div>
+                          </button>
 
-                            <div className={isExpanded ? 'tpd-pop-enter mt-2.5 block' : 'hidden'}>
-                              <div
-                                className={`inline-flex flex-col items-center rounded-xl border border-zinc-300 bg-white text-black shadow-sm ${
-                                  labelFormat === 'full' ? 'px-4 py-3 min-w-[220px]' : 'px-3 py-2'
-                                }`}
-                              >
-                                {labelFormat === 'full' && (
-                                  <span className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-zinc-600">
-                                    {item.category || 'Item'} &bull; Size {item.size || '-'}
-                                  </span>
-                                )}
-                                <div className="mb-1 flex items-center justify-center gap-1.5">
-                                  <span className="text-[11px] font-extrabold tracking-wider text-black">
-                                    {barcodeItemSizeLabel}
-                                  </span>
-                                  {renderLabelColorDots(item.colors)}
-                                </div>
-                                <div id={`barcode-label-${item.id}`}>
-                                  <Barcode
-                                    value={item.sku}
-                                    format="CODE128"
-                                    height={labelFormat === 'full' ? 36 : 32}
-                                    width={1.3}
-                                    fontSize={11}
-                                    margin={2}
-                                  />
-                                </div>
-                                {labelFormat === 'full' && (item.colors || []).length > 0 && (
-                                  <span className="mt-1 text-[10px] font-medium text-zinc-700">
-                                    Colors: {(item.colors || []).join(', ')}
-                                  </span>
-                                )}
-                              </div>
-                            </div>
+                          <button
+                            type="button"
+                            onClick={() => openCreateModal(group.category)}
+                            className={`tpd-click-press inline-flex items-center gap-1 rounded-xl border ${t.btnSecondary} px-2.5 py-1.5 text-xs font-semibold shrink-0`}
+                          >
+                            <Plus size={13} />
+                            <span>Add</span>
+                          </button>
+                        </div>
+
+                        {!isCollapsed && (
+                          <div className={`mt-3.5 space-y-3 border-t ${t.border} pt-3.5`}>
+                            {group.items.map((item) => renderInventoryCard(item))}
                           </div>
                         )}
                       </div>
                     );
                   })
+                ) : (
+                  <div className="space-y-3">
+                    {filteredItems.map((item) => renderInventoryCard(item))}
+                  </div>
                 )}
+              </div>
+            ) : activeTab === 'incoming' || activeTab === 'outgoing' ? (
+              <div className={`mt-5 space-y-4 rounded-2xl border ${t.border} ${t.cardBg3} p-4 max-h-[560px] overflow-y-auto`}>
+                <div className={`flex flex-wrap items-center justify-between gap-3 rounded-2xl border ${t.border} ${t.cardBg2} p-3`}>
+                  <p className={`text-xs ${t.textMuted}`}>
+                    {activeTab === 'incoming'
+                      ? 'Save first; stock adds when you click Arrive & Add (✓).'
+                      : 'Save first; stock deducts when you click Deduct Stock (✓).'}
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      openNewDocumentModal(activeTab === 'incoming' ? 'INCOMING' : 'OUTGOING')
+                    }
+                    className={`tpd-click-press inline-flex items-center gap-1.5 rounded-2xl border ${t.btnPrimary} px-3.5 py-2 text-xs font-bold shrink-0`}
+                  >
+                    <Plus size={14} />
+                    <span>{activeTab === 'incoming' ? 'New Procurement' : 'New outgoing'}</span>
+                  </button>
+                </div>
+
+                <div className="space-y-3">
+                  <h3 className={`text-xs font-extrabold uppercase tracking-wider ${activeTab === 'incoming' ? t.successText : t.warnText}`}>
+                    {activeTab === 'incoming'
+                      ? `Procurement (${incomingDocuments.length})`
+                      : `Outgoing (${outgoingDocuments.length})`}
+                  </h3>
+                  {(activeTab === 'incoming' ? incomingDocuments : outgoingDocuments).length === 0 ? (
+                    <p className={`py-4 text-center text-xs ${t.textMuted}`}>
+                      No documents yet.
+                    </p>
+                  ) : (
+                    (activeTab === 'incoming' ? incomingDocuments : outgoingDocuments).map((doc) =>
+                      renderStockDocumentCard(doc)
+                    )
+                  )}
+                </div>
+
+                <div className={`space-y-2.5 border-t ${t.border} pt-4`}>
+                  <h3 className={`text-xs font-extrabold uppercase tracking-wider ${t.textMuted}`}>
+                    {activeTab === 'incoming'
+                      ? `Applied Arrivals (${incomingEntries.length})`
+                      : `Applied Deductions (${outgoingEntries.length})`}
+                  </h3>
+                  {(activeTab === 'incoming' ? incomingEntries : outgoingEntries).length === 0 ? (
+                    <p className={`py-4 text-center text-xs ${t.textMuted}`}>
+                      No applied movements yet.
+                    </p>
+                  ) : (
+                    (activeTab === 'incoming' ? incomingEntries : outgoingEntries).map((entry) =>
+                      renderMovementCard(entry, activeTab)
+                    )
+                  )}
+                </div>
               </div>
             ) : (
               <div className={`mt-5 space-y-3 rounded-2xl border ${t.border} ${t.cardBg3} p-4 max-h-[500px] overflow-y-auto`}>
@@ -3032,16 +4864,19 @@ export default function InventoryDashboard() {
                         type="button"
                         onClick={() => {
                           setAuditSelectMode((prev) => {
-                            if (prev) setSelectedAuditIds(new Set());
+                            if (prev) {
+                              setSelectedAuditIds(new Set());
+                              setConfirmDeleteSelectedAudit(false);
+                            }
                             return !prev;
                           });
                         }}
                         className={`tpd-click-press inline-flex items-center gap-1.5 rounded-xl border px-3 py-1.5 text-xs font-semibold ${
-                          auditSelectMode ? t.tabActive : `${t.border} ${t.inputBg} ${t.textMuted} hover:text-white`
+                          auditSelectMode ? t.tabActive : t.tabInactive
                         }`}
                       >
                         <Check size={13} />
-                        <span>{auditSelectMode ? 'Cancel Select' : 'Select'}</span>
+                        <span>{auditSelectMode ? 'Cancel' : 'Select'}</span>
                       </button>
 
                       {auditSelectMode && (
@@ -3049,19 +4884,40 @@ export default function InventoryDashboard() {
                           <button
                             type="button"
                             onClick={toggleSelectAllAudit}
-                            className={`tpd-click-press rounded-xl border ${t.border} ${t.inputBg} px-3 py-1.5 text-xs font-semibold ${t.textMuted} hover:text-white`}
+                            className={`tpd-click-press rounded-xl border ${t.tabInactive} px-3 py-1.5 text-xs font-semibold`}
                           >
                             {selectedAuditIds.size === auditLog.length ? 'Deselect All' : 'Select All'}
                           </button>
-                          <button
-                            type="button"
-                            onClick={deleteSelectedAuditLogs}
-                            disabled={selectedAuditIds.size === 0 || isClearingAudit}
-                            className="tpd-click-press inline-flex items-center gap-1.5 rounded-xl border border-red-500/50 bg-red-600/20 px-3 py-1.5 text-xs font-bold text-red-300 transition-all hover:bg-red-600/30 disabled:opacity-40 tabular-nums"
-                          >
-                            <Trash2 size={13} />
-                            <span>Delete Selected ({selectedAuditIds.size})</span>
-                          </button>
+
+                          {!confirmDeleteSelectedAudit ? (
+                            <button
+                              type="button"
+                              onClick={() => setConfirmDeleteSelectedAudit(true)}
+                              disabled={selectedAuditIds.size === 0 || isClearingAudit}
+                              className={`inline-flex items-center gap-1.5 rounded-xl border ${t.btnDangerSubtle} px-3 py-1.5 text-xs font-bold disabled:opacity-40 tabular-nums`}
+                            >
+                              <Trash2 size={13} />
+                              <span>Delete ({selectedAuditIds.size})</span>
+                            </button>
+                          ) : (
+                            <div className="flex items-center gap-1.5">
+                              <button
+                                type="button"
+                                onClick={deleteSelectedAuditLogs}
+                                disabled={isClearingAudit}
+                                className="tpd-click-press rounded-xl border border-red-700 bg-red-600 px-3 py-1.5 text-xs font-bold text-white hover:bg-red-700 disabled:opacity-60 tabular-nums"
+                              >
+                                {isClearingAudit ? 'Deleting...' : `Confirm (${selectedAuditIds.size})`}
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => setConfirmDeleteSelectedAudit(false)}
+                                className={`tpd-click-press rounded-xl border ${t.btnSecondary} px-2.5 py-1.5 text-xs font-semibold`}
+                              >
+                                Cancel
+                              </button>
+                            </div>
+                          )}
                         </>
                       )}
                     </div>
@@ -3071,7 +4927,7 @@ export default function InventoryDashboard() {
                         type="button"
                         onClick={() => setConfirmClearAllAudit(true)}
                         disabled={isClearingAudit}
-                        className="tpd-click-press inline-flex items-center gap-1.5 rounded-xl border border-red-500/50 bg-red-600/20 px-3 py-1.5 text-xs font-bold text-red-300 transition-all hover:bg-red-600/30 disabled:opacity-40"
+                        className={`inline-flex items-center gap-1.5 rounded-xl border ${t.btnDangerSubtle} px-3 py-1.5 text-xs font-bold disabled:opacity-40`}
                       >
                         <Trash2 size={13} />
                         <span>Clear All</span>
@@ -3082,7 +4938,7 @@ export default function InventoryDashboard() {
                           type="button"
                           onClick={clearAllAuditLogs}
                           disabled={isClearingAudit}
-                          className="tpd-click-press rounded-xl border border-red-500 bg-red-600 px-3 py-1.5 text-xs font-bold text-white hover:bg-red-700 disabled:opacity-60"
+                          className="tpd-click-press rounded-xl border border-red-700 bg-red-600 px-3 py-1.5 text-xs font-bold text-white hover:bg-red-700 disabled:opacity-60"
                         >
                           {isClearingAudit ? 'Clearing...' : 'Confirm Clear'}
                         </button>
@@ -3099,7 +4955,7 @@ export default function InventoryDashboard() {
                 )}
 
                 {auditLog.length === 0 ? (
-                  <p className={`py-8 text-center text-sm ${t.textMuted}`}>No audit events recorded yet.</p>
+                  <p className={`py-8 text-center text-sm ${t.textMuted}`}>No audit events yet.</p>
                 ) : (
                   auditLog.map((entry) => {
                     const isChecked = selectedAuditIds.has(entry.id);
@@ -3109,11 +4965,11 @@ export default function InventoryDashboard() {
                         onClick={() => {
                           if (auditSelectMode) toggleAuditSelection(entry.id);
                         }}
-                        className={`flex items-center justify-between gap-3 rounded-2xl border p-3 transition-all duration-200 ease-out motion-reduce:transition-none hover:translate-x-0.5 ${
+                        className={`flex items-center justify-between gap-3 rounded-2xl border p-3 transition-all duration-200 ease-out motion-reduce:transition-none ${
                           auditSelectMode ? 'cursor-pointer' : ''
                         } ${
                           isChecked
-                            ? 'border-red-500/60 bg-red-950/20'
+                            ? `${t.needsRestockBorder} ${t.needsRestockBg}`
                             : `${t.border} ${t.cardBgHover}`
                         }`}
                       >
@@ -3125,13 +4981,13 @@ export default function InventoryDashboard() {
                               onChange={() => toggleAuditSelection(entry.id)}
                               onClick={(e) => e.stopPropagation()}
                               aria-label={`Select audit log for ${entry.item}`}
-                              className="h-4 w-4 rounded border-zinc-600 accent-red-500 cursor-pointer shrink-0"
+                              className="h-4 w-4 rounded border-zinc-600 accent-red-600 cursor-pointer shrink-0"
                             />
                           )}
                           <div className="min-w-0 flex-1">
                             <p className="font-semibold text-sm truncate">{entry.item}</p>
                             <p className={`text-xs ${t.textMuted} truncate`}>{entry.detail}</p>
-                            {entry.user && <p className="mt-0.5 text-[11px] font-medium text-emerald-400 truncate">Handled by: {entry.user}</p>}
+                            {entry.user && <p className={`mt-0.5 text-[11px] font-medium ${t.successText} truncate`}>By: {entry.user}</p>}
                           </div>
                         </div>
                         <div className="flex items-center gap-2 shrink-0">
@@ -3143,11 +4999,11 @@ export default function InventoryDashboard() {
                             type="button"
                             onClick={(e) => {
                               e.stopPropagation();
-                              deleteAuditLog(entry.id);
+                              void deleteAuditLog(entry.id);
                             }}
                             title="Delete audit log"
                             aria-label="Delete audit log"
-                            className={`tpd-click-press rounded-xl border ${t.border} p-1.5 text-red-400 transition-all duration-150 hover:scale-110 hover:bg-red-950/60`}
+                            className={`tpd-click-press rounded-xl border ${t.border} ${t.btnSecondary} p-1.5 ${t.dangerText}`}
                           >
                             <Trash2 size={13} />
                           </button>
@@ -3163,7 +5019,7 @@ export default function InventoryDashboard() {
           <div className="space-y-6">
             <div className={`rounded-3xl border ${t.border} ${t.cardBg2} p-4 sm:p-5`}>
               <h3 className="text-lg font-bold">Category manager</h3>
-              <p className={`mt-1 text-sm ${t.textMuted}`}>Keep the assortment neatly organized.</p>
+              <p className={`mt-1 text-sm ${t.textMuted}`}>Organize item groups.</p>
               <div className="mt-4 flex gap-2">
                 <input
                   value={newCategory}
@@ -3175,17 +5031,17 @@ export default function InventoryDashboard() {
                     }
                   }}
                   placeholder="New category"
-                  className={`flex-1 rounded-2xl border ${t.border} ${t.inputBg} px-3 py-2 text-base sm:text-sm outline-none transition-colors duration-200 ease-out focus:border-zinc-500 ${t.text}`}
+                  className={`flex-1 rounded-2xl border ${t.border} ${t.inputBg} px-3 py-2 text-base sm:text-sm outline-none ${t.text}`}
                 />
                 <button
                   type="button"
                   onClick={addCategory}
                   disabled={isAddingCategory}
-                  className={`inline-flex items-center justify-center gap-1.5 rounded-2xl border ${t.btnPrimary} px-3.5 py-2 text-sm font-semibold transition-all duration-200 ease-out motion-reduce:transition-none disabled:opacity-70 shrink-0`}
+                  className={`inline-flex items-center justify-center gap-1.5 rounded-2xl border ${t.btnPrimary} px-3.5 py-2 text-sm font-semibold disabled:opacity-70 shrink-0`}
                 >
                   {categoryAddSuccess ? (
                     <>
-                      <Check size={15} strokeWidth={3} className="tpd-check-pop text-emerald-500" />
+                      <Check size={15} strokeWidth={3} className={t.successText} />
                       <span>Added</span>
                     </>
                   ) : (
@@ -3195,9 +5051,9 @@ export default function InventoryDashboard() {
               </div>
               <div className="mt-4 flex flex-wrap gap-2">
                 {categories.map((category) => (
-                  <span key={category.id} className={`inline-flex items-center gap-1.5 rounded-full border ${t.badgeBg} py-1 pr-2 pl-3 text-sm transition-transform duration-150 ease-out motion-reduce:transition-none hover:scale-105`}>
+                  <span key={category.id} className={`inline-flex items-center gap-1.5 rounded-full border ${t.badgeBg} py-1 pr-2 pl-3 text-sm`}>
                     <span>{category.name}</span>
-                    <button type="button" onClick={() => deleteCategory(category.id, category.name)} title={`Remove ${category.name}`} className="tpd-click-press rounded-full p-0.5 transition-all duration-150 hover:scale-125 hover:text-red-400">
+                    <button type="button" onClick={() => deleteCategory(category.id, category.name)} title={`Remove ${category.name}`} className={`tpd-click-press rounded-full p-0.5 hover:${t.dangerText}`}>
                       <X size={13} />
                     </button>
                   </span>
@@ -3214,20 +5070,20 @@ export default function InventoryDashboard() {
                     onClick={copyRestockOrder}
                     className={`tpd-click-press inline-flex items-center gap-1.5 rounded-xl border ${t.btnSecondary} px-2.5 py-1 text-xs font-semibold`}
                   >
-                    {copiedRestockList ? <Check size={12} className="text-emerald-400" /> : <Copy size={12} />}
-                    <span>{copiedRestockList ? 'Copied' : 'Copy Order'}</span>
+                    {copiedRestockList ? <Check size={12} className={t.successText} /> : <Copy size={12} />}
+                    <span>{copiedRestockList ? 'Copied' : 'Copy List'}</span>
                   </button>
                 )}
               </div>
               <div className="mt-4 space-y-2.5">
                 {lowStockItems.map((item) => (
-                  <div key={item.id} className={`flex items-center justify-between gap-2 rounded-2xl border ${t.needsRestockBorder} ${t.needsRestockBg} p-3 text-sm transition-all duration-200 ease-out motion-reduce:transition-none hover:-translate-y-0.5`}>
+                  <div key={item.id} className={`flex items-center justify-between gap-2 rounded-2xl border ${t.needsRestockBorder} ${t.needsRestockBg} p-3 text-sm`}>
                     <div className="min-w-0">
                       <p className="font-semibold truncate">{item.name}</p>
-                      <p className={`text-xs ${t.textMuted} tabular-nums`}>{item.sku || 'No SKU'} &bull; {item.stock}/{item.min} stock</p>
+                      <p className={`text-xs ${t.textMuted} tabular-nums`}>{item.sku || 'No SKU'} &bull; {item.stock}/{item.min}</p>
                     </div>
-                    <span className="shrink-0 rounded-xl border border-red-400 bg-red-600 px-2.5 py-1 text-xs font-extrabold text-white shadow-sm">
-                      Needed Stock
+                    <span className="shrink-0 rounded-xl border border-red-700 bg-red-600 px-2.5 py-1 text-xs font-extrabold text-white shadow-sm">
+                      {item.stock <= 0 ? 'Out' : 'Buy'}
                     </span>
                   </div>
                 ))}
@@ -3237,29 +5093,464 @@ export default function InventoryDashboard() {
         </section>
       </div>
 
-      {/* App Settings Modal */}
+      {/* Procurement & Outgoing Document Modal */}
+      {docModalOpen && (
+        <div className={`${docModalClosing ? 'tpd-fade-exit' : 'tpd-fade-enter'} fixed inset-0 z-50 flex items-center justify-center ${t.overlay} p-2 sm:p-4 overflow-y-auto`}>
+          <div className={`${docModalClosing ? 'tpd-modal-exit' : 'tpd-modal-enter'} my-auto max-h-[94vh] w-full max-w-lg overflow-y-auto rounded-3xl border ${t.modalBg} p-4 sm:p-6 shadow-2xl`}>
+            <div className={`flex items-center justify-between gap-2 pb-3 border-b ${t.border}`}>
+              <div className="flex items-center gap-2.5">
+                <button
+                  type="button"
+                  onClick={closeDocModalAnimated}
+                  aria-label="Close document"
+                  className={`tpd-click-press rounded-full p-2 hover:bg-black/10 ${t.text}`}
+                >
+                  <ChevronDown size={20} className="rotate-90" />
+                </button>
+                <div>
+                  <h3 className="text-lg sm:text-xl font-black">
+                    {docKind === 'INCOMING' ? 'Procurement' : 'Outgoing'}
+                  </h3>
+                  <p className={`text-[11px] ${t.textMuted}`}>
+                    {docKind === 'INCOMING'
+                      ? 'Saved first; adds to stock on ✓'
+                      : 'Saved first; deducts from stock on ✓'}
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-1.5 relative">
+                <button
+                  type="button"
+                  onClick={() => void saveDocumentAsPending()}
+                  title="Save document"
+                  aria-label="Save document"
+                  className="tpd-click-press rounded-full bg-emerald-600 p-2 text-white shadow-md hover:bg-emerald-700"
+                >
+                  <Check size={18} strokeWidth={2.5} />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setDocMenuOpenId((prev) => (prev === 'modal' ? null : 'modal'))}
+                  aria-label="More options"
+                  className={`tpd-click-press rounded-full p-2 hover:bg-black/10 ${t.text}`}
+                >
+                  <MoreHorizontal size={18} />
+                </button>
+
+                {docMenuOpenId === 'modal' && (
+                  <div className={`absolute right-0 top-full mt-1 z-20 w-48 rounded-2xl border ${t.border} ${t.modalBg} p-1.5 shadow-xl text-xs`}>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setDocNo(getNextDocNumber(docKind));
+                        setDocDateTime(formatCurrentDocDateTime());
+                        setDocMenuOpenId(null);
+                      }}
+                      className="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-left hover:bg-black/10"
+                    >
+                      <RefreshCw size={13} />
+                      <span>Reset No &amp; Time</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setDocGoods([]);
+                        setDocMenuOpenId(null);
+                      }}
+                      className={`flex w-full items-center gap-2 rounded-xl px-3 py-2 text-left ${t.dangerText} hover:bg-red-500/10`}
+                    >
+                      <Trash2 size={13} />
+                      <span>Clear Goods</span>
+                    </button>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            <div className="mt-4">
+              <button
+                type="button"
+                onClick={() => setDocInfoExpanded((prev) => !prev)}
+                className="flex w-full items-center justify-between text-left"
+              >
+                <span className="text-sm sm:text-base font-extrabold">Document details</span>
+                {docInfoExpanded ? <ChevronUp size={18} /> : <ChevronDown size={18} />}
+              </button>
+
+              {docInfoExpanded && (
+                <div className="mt-3 space-y-3">
+                  <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                    <div className={`rounded-2xl border ${t.border} ${t.inputBg} px-3.5 py-2`}>
+                      <label className={`block text-[11px] font-semibold ${t.textMuted}`}>Document No</label>
+                      <input
+                        value={docNo}
+                        onChange={(e) => setDocNo(e.target.value)}
+                        className={`mt-0.5 w-full bg-transparent text-sm font-bold outline-none ${t.text}`}
+                      />
+                    </div>
+
+                    <div className="flex flex-col justify-center">
+                      <span className={`mb-1 block text-[11px] font-semibold ${t.textMuted}`}>
+                        {docKind === 'INCOMING' ? 'Supplier' : 'Customer'}
+                      </span>
+                      <CascadeSelect
+                        value={docPartyName}
+                        onChange={setDocPartyName}
+                        options={partyOptions}
+                        darkMode={darkMode}
+                        fullWidth
+                      />
+                    </div>
+                  </div>
+
+                  {docPartyName === 'Custom' && (
+                    <input
+                      value={docCustomParty}
+                      onChange={(e) => setDocCustomParty(e.target.value)}
+                      placeholder={docKind === 'INCOMING' ? 'Supplier name' : 'Customer name'}
+                      className={`w-full rounded-2xl border ${t.border} ${t.inputBg} px-3.5 py-2 text-xs outline-none ${t.text}`}
+                    />
+                  )}
+
+                  <div className={`rounded-2xl border ${t.border} ${t.inputBg} px-3.5 py-2`}>
+                    <label className={`block text-[11px] font-semibold ${t.textMuted}`}>Date &amp; Time</label>
+                    <input
+                      value={docDateTime}
+                      onChange={(e) => setDocDateTime(e.target.value)}
+                      className={`mt-0.5 w-full bg-transparent text-sm font-bold tabular-nums outline-none ${t.text}`}
+                    />
+                  </div>
+
+                  <div className={`rounded-2xl border ${t.border} ${t.inputBg} px-3.5 py-2`}>
+                    <label className={`block text-[11px] font-semibold ${t.textMuted}`}>Note</label>
+                    <input
+                      value={docDescription}
+                      onChange={(e) => setDocDescription(e.target.value)}
+                      placeholder="Optional note"
+                      className={`mt-0.5 w-full bg-transparent text-sm outline-none ${t.text}`}
+                    />
+                  </div>
+                </div>
+              )}
+            </div>
+
+            <div className="mt-5">
+              <button
+                type="button"
+                onClick={() => setGoodsInfoExpanded((prev) => !prev)}
+                className="flex w-full items-center justify-between text-left"
+              >
+                <span className="text-sm sm:text-base font-extrabold">
+                  Items ({docGoods.length})
+                </span>
+                {goodsInfoExpanded ? <ChevronUp size={18} /> : <ChevronDown size={18} />}
+              </button>
+
+              {goodsInfoExpanded && (
+                <div className="mt-3 space-y-3">
+                  <div className="flex items-center gap-2">
+                    <label className={`flex flex-1 items-center gap-2 rounded-2xl border ${t.border} ${t.inputBg} px-3.5 py-2`}>
+                      <Search size={16} className={iconClass} />
+                      <input
+                        value={docGoodsSearch}
+                        onChange={(e) => setDocGoodsSearch(e.target.value)}
+                        placeholder="Search items..."
+                        className={`w-full bg-transparent text-sm outline-none ${t.text}`}
+                      />
+                    </label>
+                    <button
+                      type="button"
+                      onClick={() => openScannerAnimated(true)}
+                      title="Scan barcode into items"
+                      aria-label="Scan barcode into items"
+                      className={`tpd-click-press rounded-2xl border ${t.border} ${t.btnSecondary} p-2.5`}
+                    >
+                      <BarcodeScanIcon className="h-4 w-4" />
+                    </button>
+                  </div>
+
+                  {filteredDocGoods.length === 0 ? (
+                    <div className={`rounded-2xl border border-dashed ${t.border} ${t.cardBg3} py-7 px-4 text-center`}>
+                      <Box size={32} className={`mx-auto ${iconClass} opacity-60`} />
+                      <p className={`mt-2 text-xs font-semibold ${t.textMuted}`}>No items added</p>
+                    </div>
+                  ) : (
+                    <div className="space-y-2 max-h-48 overflow-y-auto pr-1">
+                      {filteredDocGoods.map((line) => (
+                        <div
+                          key={line.id}
+                          className={`flex items-center justify-between gap-2 rounded-2xl border ${t.border} ${t.cardBg3} px-3 py-2 text-xs`}
+                        >
+                          <div className="min-w-0 flex-1">
+                            <p className="font-bold truncate">{line.name}</p>
+                            <p className={`text-[11px] ${t.textMuted2} truncate`}>
+                              {line.sku || 'No SKU'} &bull; {line.size || '-'}
+                            </p>
+                          </div>
+                          <div className="flex items-center gap-1.5 shrink-0">
+                            <button
+                              type="button"
+                              onClick={() => updateDocLineQty(line.id, line.qty - 1)}
+                              className={`rounded-lg border ${t.border} ${t.btnSecondary} px-2 py-0.5 font-bold`}
+                            >
+                              -
+                            </button>
+                            <input
+                              type="number"
+                              min={1}
+                              value={line.qty}
+                              onChange={(e) => updateDocLineQty(line.id, parseInt(e.target.value, 10))}
+                              className={`w-12 rounded-lg border ${t.border} ${t.inputBg} px-1 py-0.5 text-center font-bold tabular-nums outline-none ${t.text}`}
+                            />
+                            <button
+                              type="button"
+                              onClick={() => updateDocLineQty(line.id, line.qty + 1)}
+                              className={`rounded-lg border ${t.border} ${t.btnSecondary} px-2 py-0.5 font-bold`}
+                            >
+                              +
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => removeDocLine(line.id)}
+                              className={`rounded-lg p-1 ${t.dangerText} hover:bg-red-500/10`}
+                            >
+                              <Trash2 size={13} />
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {addGoodPickerOpen && (
+                    <div className={`rounded-2xl border ${t.border} ${t.cardBg2} p-3 space-y-2.5`}>
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-xs font-bold">Select item</span>
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() => setInlineNewGoodOpen((prev) => !prev)}
+                            className="tpd-click-press inline-flex items-center gap-1 rounded-xl bg-amber-700 px-2.5 py-1 text-[11px] font-extrabold text-white hover:bg-amber-800"
+                          >
+                            <Plus size={12} />
+                            <span>{inlineNewGoodOpen ? 'Close' : 'New Item'}</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setAddGoodPickerOpen(false);
+                              setInlineNewGoodOpen(false);
+                            }}
+                            className={`text-xs ${t.textMuted}`}
+                          >
+                            Done
+                          </button>
+                        </div>
+                      </div>
+
+                      {inlineNewGoodOpen && (
+                        <div className={`rounded-2xl border ${t.border} ${t.cardBg3} p-3 space-y-2.5`}>
+                          <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                            <input
+                              value={inlineNewGood.name}
+                              onChange={(e) =>
+                                setInlineNewGood((prev) => ({ ...prev, name: e.target.value }))
+                              }
+                              placeholder="Item name"
+                              className={`rounded-xl border ${t.border} ${t.inputBg} px-2.5 py-1.5 text-xs outline-none ${t.text}`}
+                            />
+                            <div className="flex items-center gap-1.5">
+                              <input
+                                value={inlineNewGood.sku}
+                                onChange={(e) =>
+                                  setInlineNewGood((prev) => ({ ...prev, sku: e.target.value }))
+                                }
+                                placeholder="SKU"
+                                className={`flex-1 rounded-xl border ${t.border} ${t.inputBg} px-2.5 py-1.5 text-xs outline-none ${t.text}`}
+                              />
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  setInlineNewGood((prev) => ({
+                                    ...prev,
+                                    sku: buildSkuForCategory(prev.category),
+                                  }))
+                                }
+                                className={`rounded-xl border ${t.border} ${t.btnSecondary} px-2 py-1.5 text-[10px] font-bold shrink-0`}
+                              >
+                                Auto
+                              </button>
+                            </div>
+                            <CascadeSelect
+                              value={inlineNewGood.category}
+                              onChange={(valCat) =>
+                                setInlineNewGood((prev) => ({ ...prev, category: valCat }))
+                              }
+                              options={
+                                modalCategoryOptions.length > 0
+                                  ? modalCategoryOptions
+                                  : [{ value: 'General', label: 'General' }]
+                              }
+                              darkMode={darkMode}
+                              fullWidth
+                            />
+                            <div className="grid grid-cols-2 gap-1.5">
+                              <input
+                                value={inlineNewGood.size}
+                                onChange={(e) =>
+                                  setInlineNewGood((prev) => ({ ...prev, size: e.target.value }))
+                                }
+                                placeholder="Size"
+                                className={`rounded-xl border ${t.border} ${t.inputBg} px-2.5 py-1.5 text-xs outline-none ${t.text}`}
+                              />
+                              <input
+                                type="number"
+                                min={1}
+                                value={inlineNewGood.qty}
+                                onChange={(e) =>
+                                  setInlineNewGood((prev) => ({ ...prev, qty: e.target.value }))
+                                }
+                                placeholder="Qty"
+                                className={`rounded-xl border ${t.border} ${t.inputBg} px-2.5 py-1.5 text-xs font-bold tabular-nums outline-none ${t.text}`}
+                              />
+                            </div>
+                          </div>
+
+                          <div className="flex justify-end">
+                            <button
+                              type="button"
+                              onClick={addInlineNewItemToDocument}
+                              disabled={!inlineNewGood.name.trim()}
+                              className={`tpd-click-press rounded-xl border ${t.btnPrimary} px-3.5 py-1.5 text-xs font-bold disabled:opacity-40`}
+                            >
+                              Add Item
+                            </button>
+                          </div>
+                        </div>
+                      )}
+
+                      <input
+                        value={addGoodCatalogQuery}
+                        onChange={(e) => setAddGoodCatalogQuery(e.target.value)}
+                        placeholder="Filter items..."
+                        className={`w-full rounded-xl border ${t.border} ${t.inputBg} px-3 py-1.5 text-xs outline-none ${t.text}`}
+                      />
+                      <div className="max-h-36 overflow-y-auto space-y-1">
+                        {catalogSearchResults.length === 0 ? (
+                          <div className="py-3 text-center space-y-2">
+                            <p className={`text-xs ${t.textMuted}`}>No matching items.</p>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setInlineNewGood((prev) => ({
+                                  ...prev,
+                                  name: addGoodCatalogQuery.trim(),
+                                }));
+                                setInlineNewGoodOpen(true);
+                              }}
+                              className="tpd-click-press inline-flex items-center gap-1 rounded-xl bg-amber-700 px-3 py-1.5 text-xs font-bold text-white hover:bg-amber-800"
+                            >
+                              <Plus size={12} />
+                              <span>Create &ldquo;{addGoodCatalogQuery.trim() || 'Item'}&rdquo;</span>
+                            </button>
+                          </div>
+                        ) : (
+                          catalogSearchResults.map((invItem) => (
+                            <button
+                              key={invItem.id}
+                              type="button"
+                              onClick={() => addCatalogItemToDocument(invItem, 1)}
+                              className={`flex w-full items-center justify-between rounded-xl border ${t.border} ${t.cardBgHover} px-3 py-1.5 text-left text-xs`}
+                            >
+                              <span className="font-semibold truncate">
+                                {invItem.name} <span className={t.textMuted2}>({invItem.size} • {invItem.stock})</span>
+                              </span>
+                              <span className="rounded-lg bg-amber-700 px-2 py-0.5 text-[10px] font-bold text-white shrink-0">
+                                + Add
+                              </span>
+                            </button>
+                          ))
+                        )}
+                      </div>
+                    </div>
+                  )}
+
+                  <div className="grid grid-cols-2 gap-2.5 pt-2">
+                    <button
+                      type="button"
+                      onClick={() => setAddGoodPickerOpen((prev) => !prev)}
+                      className="tpd-click-press rounded-2xl bg-amber-700 px-4 py-3 text-xs sm:text-sm font-extrabold text-white shadow-md hover:bg-amber-800"
+                    >
+                      Add item
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => openScannerAnimated(true)}
+                      className={`tpd-click-press rounded-2xl border-2 border-amber-700 bg-transparent px-4 py-3 text-xs sm:text-sm font-extrabold ${t.warnText} hover:bg-amber-700/10`}
+                    >
+                      Scan item
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
       {isSettingsOpen && (
-        <div className={`${isSettingsClosing ? 'tpd-fade-exit' : 'tpd-fade-enter'} fixed inset-0 z-50 flex items-center justify-center ${t.overlay} p-3 sm:p-4 overflow-y-auto transition-opacity duration-200 ease-out motion-reduce:transition-none`}>
-          <div className={`${isSettingsClosing ? 'tpd-modal-exit' : 'tpd-modal-enter'} my-auto w-full max-w-md rounded-3xl border ${t.modalBg} p-4 sm:p-6 shadow-2xl transition-all duration-200 ease-out motion-reduce:transition-none`}>
+        <div className={`${isSettingsClosing ? 'tpd-fade-exit' : 'tpd-fade-enter'} fixed inset-0 z-50 flex items-center justify-center ${t.overlay} p-3 sm:p-4 overflow-y-auto`}>
+          <div className={`${isSettingsClosing ? 'tpd-modal-exit' : 'tpd-modal-enter'} my-auto max-h-[90vh] overflow-y-auto w-full max-w-md rounded-3xl border ${t.modalBg} p-4 sm:p-6 shadow-2xl`}>
             <div className="flex items-center justify-between">
               <div>
                 <p className={`text-xs uppercase tracking-[0.3em] ${t.textMuted}`}>PREFERENCES</p>
-                <h3 className="text-xl sm:text-2xl font-black">App Settings</h3>
+                <h3 className="text-xl sm:text-2xl font-black">Settings</h3>
               </div>
               <button
                 type="button"
                 onClick={closeSettingsAnimated}
-                className={`tpd-click-press rounded-full border ${t.border} px-3 py-1 text-xs transition-all duration-150 hover:scale-105`}
+                className={`tpd-click-press rounded-full border ${t.border} ${t.btnSecondary} px-3 py-1 text-xs`}
               >
                 Close
               </button>
             </div>
 
             <div className="mt-5 space-y-4">
+              <div className={`rounded-2xl border ${t.border} ${t.cardBg3} p-3.5`}>
+                <p className="text-sm font-bold">Export Inventory</p>
+                <div className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-3">
+                  <button
+                    type="button"
+                    onClick={() => exportInventory('csv')}
+                    className={`rounded-xl border ${t.btnSecondary} px-3 py-2 text-xs font-semibold flex items-center justify-center gap-1.5`}
+                  >
+                    <Download size={13} />
+                    <span>CSV</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleExportPdfChoice('all')}
+                    className={`rounded-xl border ${t.btnSecondary} px-3 py-2 text-xs font-semibold flex items-center justify-center gap-1.5`}
+                  >
+                    <FileText size={13} />
+                    <span>PDF (All)</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleExportPdfChoice('filtered')}
+                    className={`rounded-xl border ${t.btnSecondary} px-3 py-2 text-xs font-semibold flex items-center justify-center gap-1.5`}
+                  >
+                    <FileText size={13} />
+                    <span>PDF (Filtered)</span>
+                  </button>
+                </div>
+              </div>
+
               <div className={`flex items-center justify-between gap-3 rounded-2xl border ${t.border} ${t.cardBg3} p-3.5`}>
                 <div>
                   <p className="text-sm font-bold">Dark Mode</p>
-                  <p className={`text-xs ${t.textMuted}`}>Switch between dark and light interface</p>
+                  <p className={`text-xs ${t.textMuted}`}>Toggle dark or light theme</p>
                 </div>
                 <button
                   type="button"
@@ -3272,21 +5563,20 @@ export default function InventoryDashboard() {
 
               <div className={`flex items-center justify-between gap-3 rounded-2xl border ${t.border} ${t.cardBg3} p-3.5`}>
                 <div>
-                  <p className="text-sm font-bold">Top Low-Stock Pop-Up</p>
-                  <p className={`text-xs ${t.textMuted}`}>Show Messenger-style alert at top on low stock</p>
+                  <p className="text-sm font-bold">Stock Alert Pop-Up</p>
+                  <p className={`text-xs ${t.textMuted}`}>Top alert on low or empty stock</p>
                 </div>
                 <button
                   type="button"
                   onClick={() => setShowLowStockPopUp((prev) => !prev)}
                   className={`rounded-xl border px-3 py-1.5 text-xs font-semibold ${showLowStockPopUp ? t.tabActive : t.tabInactive}`}
                 >
-                  {showLowStockPopUp ? 'Enabled' : 'Muted'}
+                  {showLowStockPopUp ? 'On' : 'Off'}
                 </button>
               </div>
 
               <div className={`rounded-2xl border ${t.border} ${t.cardBg3} p-3.5`}>
-                <p className="text-sm font-bold">Barcode Label Size</p>
-                <p className={`text-xs ${t.textMuted} mt-0.5`}>Compact sticker or full hangtag/shelf label</p>
+                <p className="text-sm font-bold">Barcode Label</p>
                 <div className="mt-3 grid grid-cols-2 gap-2">
                   {(['compact', 'full'] as BarcodeLabelFormat[]).map((fmt) => (
                     <button
@@ -3294,18 +5584,17 @@ export default function InventoryDashboard() {
                       type="button"
                       onClick={() => setLabelFormat(fmt)}
                       className={`rounded-xl border px-2.5 py-1.5 text-xs font-semibold capitalize ${
-                        labelFormat === fmt ? t.tabActive : `${t.border} ${t.inputBg} ${t.textMuted}`
+                        labelFormat === fmt ? t.tabActive : t.tabInactive
                       }`}
                     >
-                      {fmt === 'compact' ? 'Compact Sticker' : 'Full Hangtag'}
+                      {fmt === 'compact' ? 'Compact' : 'Full'}
                     </button>
                   ))}
                 </div>
               </div>
 
               <div className={`rounded-2xl border ${t.border} ${t.cardBg3} p-3.5`}>
-                <p className="text-sm font-bold">Default Scanner Action</p>
-                <p className={`text-xs ${t.textMuted} mt-0.5`}>Choose what happens when a barcode is scanned</p>
+                <p className="text-sm font-bold">Scanner Action</p>
                 <div className="mt-3 grid grid-cols-3 gap-2">
                   {(['search', 'add', 'deduct'] as ScanActionMode[]).map((mode) => (
                     <button
@@ -3313,26 +5602,26 @@ export default function InventoryDashboard() {
                       type="button"
                       onClick={() => setScanMode(mode)}
                       className={`rounded-xl border px-2.5 py-1.5 text-xs font-semibold capitalize ${
-                        scanMode === mode ? t.tabActive : `${t.border} ${t.inputBg} ${t.textMuted}`
+                        scanMode === mode ? t.tabActive : t.tabInactive
                       }`}
                     >
-                      {mode === 'search' ? 'Find Item' : mode === 'add' ? 'Add Stock' : 'Deduct'}
+                      {mode === 'search' ? 'Find' : mode === 'add' ? 'Add' : 'Deduct'}
                     </button>
                   ))}
                 </div>
               </div>
 
               <div className={`rounded-2xl border ${t.needsRestockBorder} ${t.needsRestockBg} p-3.5`}>
-                <p className="text-sm font-bold text-red-400">Delete Account</p>
+                <p className={`text-sm font-bold ${t.dangerText}`}>Delete Account</p>
                 <p className={`text-xs ${t.textMuted} mt-0.5`}>
-                  Sign out and remove access for <span className="font-semibold">{user.email || actorName}</span>.
+                  Sign out and log a deletion request for <span className="font-semibold">{user.email || actorName}</span>.
                 </p>
 
                 {!confirmDeleteAccount ? (
                   <button
                     type="button"
                     onClick={() => setConfirmDeleteAccount(true)}
-                    className="tpd-click-press mt-3 inline-flex items-center gap-1.5 rounded-xl border border-red-500/50 bg-red-600/20 px-3.5 py-2 text-xs font-bold text-red-300 transition-all duration-150 hover:bg-red-600/30"
+                    className={`mt-3 inline-flex items-center gap-1.5 rounded-xl border ${t.btnDangerSubtle} px-3.5 py-2 text-xs font-bold`}
                   >
                     <Trash2 size={13} />
                     <span>Delete Account</span>
@@ -3343,14 +5632,14 @@ export default function InventoryDashboard() {
                       type="button"
                       onClick={handleDeleteAccount}
                       disabled={isDeletingAccount}
-                      className="tpd-click-press inline-flex items-center gap-1.5 rounded-xl border border-red-500 bg-red-600 px-3.5 py-2 text-xs font-bold text-white transition-all duration-150 hover:bg-red-700 disabled:opacity-60"
+                      className="tpd-click-press inline-flex items-center gap-1.5 rounded-xl border border-red-700 bg-red-600 px-3.5 py-2 text-xs font-bold text-white hover:bg-red-700 disabled:opacity-60"
                     >
-                      <span>{isDeletingAccount ? 'Deleting...' : 'Confirm Delete'}</span>
+                      <span>{isDeletingAccount ? 'Deleting...' : 'Confirm'}</span>
                     </button>
                     <button
                       type="button"
                       onClick={() => setConfirmDeleteAccount(false)}
-                      className={`tpd-click-press rounded-xl border ${t.btnSecondary} px-3 py-2 text-xs font-semibold`}
+                      className={`tpd-click-press rounded-xl border ${t.btnSecondary} px-3.5 py-2 text-xs font-semibold`}
                     >
                       Cancel
                     </button>
@@ -3373,389 +5662,282 @@ export default function InventoryDashboard() {
       )}
 
       {isScannerOpen && (
-        <div className={`${isScannerClosing ? 'tpd-fade-exit' : 'tpd-fade-enter'} fixed inset-0 z-50 flex items-center justify-center ${t.overlay} p-3 sm:p-4 overflow-y-auto transition-opacity duration-200 ease-out motion-reduce:transition-none`}>
-          <div className={`${isScannerClosing ? 'tpd-modal-exit' : 'tpd-modal-enter'} my-auto max-h-[92vh] overflow-y-auto w-full max-w-md rounded-3xl border ${t.modalBg} p-4 sm:p-6 shadow-2xl transition-all duration-200 ease-out motion-reduce:transition-none`}>
-            <div className="flex items-center justify-between">
-              <div>
-                <p className={`text-xs uppercase tracking-[0.3em] ${t.textMuted}`}>CAMERA &amp; WEDGE SCANNER</p>
-                <h3 className="text-xl font-black">Scan item barcode</h3>
+        <div className={`${isScannerClosing ? 'tpd-fade-exit' : 'tpd-fade-enter'} fixed inset-0 z-50 flex items-center justify-center ${t.overlay} p-2 sm:p-4 overflow-y-auto`}>
+          <div className={`${isScannerClosing ? 'tpd-modal-exit' : 'tpd-modal-enter'} my-auto max-h-[92dvh] overflow-y-auto w-full max-w-sm sm:max-w-md rounded-3xl border ${t.modalBg} p-3.5 sm:p-6 shadow-2xl`}>
+            <div className="flex items-center justify-between gap-2">
+              <div className="min-w-0">
+                <p className={`text-[10px] sm:text-xs uppercase tracking-[0.25em] ${t.textMuted} truncate`}>
+                  {docModalOpen ? `SCAN • ${docNo}` : 'SCANNER'}
+                </p>
+                <h3 className="text-lg sm:text-xl font-black truncate">
+                  {docModalOpen ? 'Scan into document' : 'Scan barcode'}
+                </h3>
               </div>
               <button
                 type="button"
                 onClick={closeScannerAnimated}
-                className={`tpd-click-press rounded-full border ${t.border} px-3 py-1 text-xs transition-all duration-150 hover:scale-105`}
+                className={`tpd-click-press shrink-0 rounded-full border ${t.border} ${t.btnSecondary} px-3 py-1 text-xs`}
               >
                 Close
               </button>
             </div>
 
-            {/* Continuous Scan & Beep Toggles */}
-            <div className="mt-3 flex flex-wrap items-center justify-between gap-2">
+            <div className="mt-2.5 flex items-center justify-between gap-2">
               <button
                 type="button"
                 onClick={() => setContinuousScan((prev) => !prev)}
-                className={`tpd-click-press inline-flex items-center gap-1.5 rounded-2xl border px-3 py-1.5 text-xs font-semibold ${
-                  continuousScan ? t.tabActive : `${t.border} ${t.inputBg} ${t.textMuted}`
+                className={`tpd-click-press inline-flex items-center gap-1 rounded-2xl border px-2.5 py-1.5 text-[11px] font-semibold ${
+                  continuousScan ? t.tabActive : t.tabInactive
                 }`}
               >
-                <Repeat size={13} />
+                <Repeat size={12} />
                 <span>Continuous: {continuousScan ? 'On' : 'Off'}</span>
               </button>
 
               <button
                 type="button"
                 onClick={() => setScanSoundEnabled((prev) => !prev)}
-                className={`tpd-click-press inline-flex items-center gap-1.5 rounded-2xl border px-3 py-1.5 text-xs font-semibold ${
-                  scanSoundEnabled ? t.tabActive : `${t.border} ${t.inputBg} ${t.textMuted}`
+                className={`tpd-click-press inline-flex items-center gap-1 rounded-2xl border px-2.5 py-1.5 text-[11px] font-semibold ${
+                  scanSoundEnabled ? t.tabActive : t.tabInactive
                 }`}
               >
-                {scanSoundEnabled ? <Volume2 size={13} /> : <VolumeX size={13} />}
+                {scanSoundEnabled ? <Volume2 size={12} /> : <VolumeX size={12} />}
                 <span>Beep: {scanSoundEnabled ? 'On' : 'Off'}</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setCameraRestartNonce((n) => n + 1)}
+                className={`tpd-click-press inline-flex items-center gap-1 rounded-2xl border ${t.tabInactive} px-2.5 py-1.5 text-[11px] font-semibold`}
+              >
+                <RefreshCw size={12} />
+                <span>Retry</span>
               </button>
             </div>
 
             {scanSuccessBanner && (
-              <div className="tpd-scan-success mt-3 flex items-center gap-2.5 rounded-2xl border border-emerald-500/60 bg-emerald-950/50 px-4 py-3 text-xs font-bold text-emerald-300 shadow-lg">
-                <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-emerald-500 text-black">
-                  <Check size={14} strokeWidth={3} />
+              <div className={`tpd-scan-success mt-2.5 flex items-center gap-2 rounded-2xl border ${t.okBg} px-3 py-2 text-xs font-bold shadow-lg`}>
+                <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-emerald-600 text-white">
+                  <Check size={12} strokeWidth={3} />
                 </span>
                 <span className="truncate">{scanSuccessBanner}</span>
               </div>
             )}
 
-            <div className="mt-4 grid grid-cols-3 gap-2">
-              <button
-                type="button"
-                onClick={() => {
-                  setScanMode('search');
-                  setScanFeedback(null);
-                }}
-                className={`rounded-2xl border px-3 py-2 text-xs font-semibold transition-all duration-150 ${
-                  scanMode === 'search' ? t.tabActive : `${t.border} ${t.inputBg} ${t.textMuted}`
-                }`}
-              >
-                Find Item
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  setScanMode('add');
-                  setScanFeedback(null);
-                }}
-                className={`rounded-2xl border px-3 py-2 text-xs font-semibold transition-all duration-150 ${
-                  scanMode === 'add' ? t.tabActive : `${t.border} ${t.inputBg} ${t.textMuted}`
-                }`}
-              >
-                Add Stock
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  setScanMode('deduct');
-                  setScanFeedback(null);
-                }}
-                className={`rounded-2xl border px-3 py-2 text-xs font-semibold transition-all duration-150 ${
-                  scanMode === 'deduct' ? t.tabActive : `${t.border} ${t.inputBg} ${t.textMuted}`
-                }`}
-              >
-                Deduct Stock
-              </button>
-            </div>
-
-            {scanMode !== 'search' && (
-              <div className={`tpd-pop-enter mt-3 flex items-center justify-between gap-3 rounded-2xl border ${t.border} ${t.cardBg3} px-3.5 py-2.5`}>
-                <span className={`text-xs font-semibold ${t.textMuted}`}>
-                  {scanMode === 'add' ? 'Quantity to add per scan' : 'Quantity to deduct per scan'}
-                </span>
-                <div className="flex items-center gap-2">
+            {!docModalOpen && (
+              <div className="mt-3 grid grid-cols-3 gap-1.5">
+                {(['search', 'add', 'deduct'] as ScanActionMode[]).map((mode) => (
                   <button
+                    key={mode}
                     type="button"
-                    onClick={() => setScanQuantity((q) => Math.max(1, (Number(q) || 1) - 1))}
-                    className={`rounded-xl border ${t.border} ${t.btnSecondary} px-2.5 py-1 text-xs font-bold`}
-                  >
-                    -
-                  </button>
-                  <input
-                    type="number"
-                    min={1}
-                    value={scanQuantity}
-                    onChange={(e) => {
-                      const valNum = parseInt(e.target.value, 10);
-                      setScanQuantity(Number.isNaN(valNum) ? 1 : Math.max(1, valNum));
+                    onClick={() => {
+                      setScanMode(mode);
+                      setScanFeedback(null);
                     }}
-                    aria-label="Scan quantity"
-                    className={`w-16 rounded-xl border ${t.border} ${t.inputBg} px-2 py-1 text-center text-base sm:text-xs font-bold tabular-nums outline-none ${t.text}`}
-                  />
-                  <button
-                    type="button"
-                    onClick={() => setScanQuantity((q) => Math.max(1, (Number(q) || 1) + 1))}
-                    className={`rounded-xl border ${t.border} ${t.btnSecondary} px-2.5 py-1 text-xs font-bold`}
+                    className={`rounded-2xl border px-2 py-2 text-xs font-semibold ${
+                      scanMode === mode ? t.tabActive : t.tabInactive
+                    }`}
                   >
-                    +
+                    {mode === 'search' ? 'Find' : mode === 'add' ? 'Add' : 'Deduct'}
                   </button>
+                ))}
+              </div>
+            )}
+
+            {(docModalOpen || scanMode !== 'search') && (
+              <div className="mt-2.5">
+                <div className="flex items-center justify-between gap-2 mb-1">
+                  <label className={`block text-[11px] ${t.textMuted}`}>Qty per scan</label>
+                  <div className="flex items-center gap-1">
+                    {[1, 5, 10, 25].map((preset) => (
+                      <button
+                        key={preset}
+                        type="button"
+                        onClick={() => setScanQuantity(preset)}
+                        className={`rounded-lg border px-2 py-0.5 text-[11px] font-bold tabular-nums ${
+                          scanQuantity === preset ? t.tabActive : t.tabInactive
+                        }`}
+                      >
+                        {preset}
+                      </button>
+                    ))}
+                  </div>
                 </div>
+                <input
+                  type="number"
+                  min={1}
+                  value={scanQuantity}
+                  onChange={(e) => setScanQuantity(Math.max(1, parseInt(e.target.value, 10) || 1))}
+                  className={`w-full rounded-2xl border ${t.border} ${t.inputBg} px-3.5 py-2 text-base sm:text-sm font-bold tabular-nums outline-none ${t.text}`}
+                />
               </div>
             )}
 
-            {/* USB / Handheld Barcode Wedge Input */}
-            <div className="mt-3 flex gap-2">
-              <input
-                value={manualWedgeSku}
-                onChange={(e) => setManualWedgeSku(e.target.value)}
-                onKeyDown={async (e) => {
-                  if (e.key === 'Enter' && manualWedgeSku.trim()) {
-                    e.preventDefault();
-                    const codeToProcess = manualWedgeSku.trim();
-                    setManualWedgeSku('');
-                    await processScannedCode(codeToProcess, undefined, true);
-                  }
-                }}
-                placeholder="Type or USB-scan SKU + Enter"
-                className={`flex-1 rounded-2xl border ${t.border} ${t.inputBg} px-3 py-2 text-sm outline-none ${t.text}`}
+            <div className="mt-3">
+              <div
+                id="barcode-camera-reader"
+                className={`relative w-full aspect-[4/3] max-h-[210px] sm:max-h-[235px] overflow-hidden rounded-2xl border ${t.border} bg-black [&_video]:h-full [&_video]:w-full [&_video]:object-cover`}
               />
-              <button
-                type="button"
-                onClick={async () => {
-                  if (!manualWedgeSku.trim()) return;
-                  const codeToProcess = manualWedgeSku.trim();
-                  setManualWedgeSku('');
-                  await processScannedCode(codeToProcess, undefined, true);
-                }}
-                className={`rounded-2xl border ${t.btnPrimary} px-3.5 py-2 text-xs font-semibold shrink-0`}
-              >
-                Apply
-              </button>
+              {scannerError && (
+                <div className={`mt-2 rounded-2xl border ${t.lowBg} px-3 py-2 text-xs font-medium`}>
+                  {scannerError}
+                </div>
+              )}
+              {scanFeedback && (
+                <div className={`tpd-pop-enter mt-2 rounded-2xl border ${t.okBg} px-3 py-2 text-xs font-medium`}>
+                  {scanFeedback}
+                </div>
+              )}
             </div>
-
-            {scannerError && (
-              <div className="mt-3 rounded-2xl border border-red-900/50 bg-red-950/40 px-4 py-3 text-xs text-red-300">
-                {scannerError}
-              </div>
-            )}
-
-            {scanFeedback && (
-              <div className="mt-3 rounded-2xl border border-amber-900/50 bg-amber-950/40 px-4 py-3 text-xs text-amber-200">
-                {scanFeedback}
-              </div>
-            )}
-
-            <div className={`mt-4 overflow-hidden rounded-2xl border ${t.border} bg-black`}>
-              <div id="barcode-camera-reader" className="min-h-56 w-full" />
-            </div>
-
-            <p className={`mt-3 text-xs ${t.textMuted}`}>
-              {continuousScan
-                ? 'Continuous scan is active (double beep): scan multiple items in a row without reopening the camera.'
-                : 'Single-scan mode (single beep): closes automatically after a successful scan.'}
-            </p>
           </div>
         </div>
       )}
 
       {isModalOpen && (
-        <div className={`${isModalClosing ? 'tpd-fade-exit' : 'tpd-fade-enter'} fixed inset-0 z-50 flex items-center justify-center ${t.overlay} p-3 sm:p-4 overflow-y-auto transition-opacity duration-200 ease-out motion-reduce:transition-none`}>
-          <div className={`${isModalClosing ? 'tpd-modal-exit' : 'tpd-modal-enter'} my-auto max-h-[90vh] w-full max-w-xl overflow-y-auto scroll-smooth rounded-3xl border ${t.modalBg} p-4 sm:p-6 shadow-2xl transition-all duration-200 ease-out motion-reduce:transition-none`}>
+        <div className={`${isModalClosing ? 'tpd-fade-exit' : 'tpd-fade-enter'} fixed inset-0 z-50 flex items-center justify-center ${t.overlay} p-3 sm:p-4 overflow-y-auto`}>
+          <div className={`${isModalClosing ? 'tpd-modal-exit' : 'tpd-modal-enter'} my-auto max-h-[90vh] overflow-y-auto w-full max-w-lg rounded-3xl border ${t.modalBg} p-4 sm:p-6 shadow-2xl`}>
             <div className="flex items-center justify-between">
               <div>
-                <p className={`text-xs uppercase tracking-[0.3em] ${t.textMuted}`}>{editingId ? 'Edit item' : 'New item'}</p>
-                <h3 className="text-xl sm:text-2xl font-black">Item details</h3>
+                <p className={`text-xs uppercase tracking-[0.3em] ${t.textMuted}`}>{editingId ? 'UPDATE' : 'CREATE'}</p>
+                <h3 className="text-xl sm:text-2xl font-black">{editingId ? 'Edit item' : 'New item'}</h3>
               </div>
-              <button onClick={closeModalAnimated} className={`tpd-click-press rounded-full border ${t.border} px-3 py-1 text-xs transition-all duration-150 hover:scale-105`}>Close</button>
+              <button onClick={closeModalAnimated} className={`tpd-click-press rounded-full border ${t.border} ${t.btnSecondary} px-3 py-1 text-xs`}>Close</button>
             </div>
-
-            <div className="mt-5 grid gap-3 sm:gap-4 sm:grid-cols-2">
-              <label className="text-sm">
-                <span className={`mb-1.5 block ${t.textMuted}`}>Item Name</span>
-                <input value={form.name} onChange={(event) => setForm((current) => ({ ...current, name: event.target.value }))} className={`w-full rounded-2xl border ${t.border} ${t.inputBg} px-3 py-2 text-base sm:text-sm outline-none transition-colors duration-200 ease-out focus:border-zinc-500 ${t.text}`} />
-              </label>
-              <div className="text-sm">
-                <div className="mb-1.5 flex items-center justify-between gap-2">
-                  <span className={t.textMuted}>SKU / Barcode</span>
+            <div className="mt-5 grid gap-4 sm:grid-cols-2">
+              <div className="sm:col-span-2">
+                <label className={`mb-1 block text-xs ${t.textMuted}`}>Item Name</label>
+                <input value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} className={`w-full rounded-2xl border ${t.border} ${t.inputBg} px-3.5 py-2 text-base sm:text-sm outline-none ${t.text}`} />
+              </div>
+              <div>
+                <label className={`mb-1 block text-xs ${t.textMuted}`}>SKU / Barcode</label>
+                <div className="flex items-center gap-2">
+                  <input value={form.sku} onChange={(event) => setForm({ ...form, sku: event.target.value })} placeholder="Scan or type SKU" className={`w-full rounded-2xl border ${t.border} ${t.inputBg} px-3.5 py-2 text-base sm:text-sm outline-none ${t.text}`} />
                   <button
                     type="button"
                     onClick={generateCustomSku}
-                    className={`tpd-click-press inline-flex items-center gap-1 rounded-xl border ${t.border} ${t.cardBg3} px-2 py-0.5 text-[11px] font-semibold transition-all duration-150 hover:scale-105`}
+                    title="Auto-generate SKU"
+                    className={`tpd-click-press shrink-0 rounded-2xl border ${t.btnSecondary} px-3 py-2 text-xs font-semibold`}
                   >
-                    <Sparkles size={11} />
-                    <span>Auto SKU</span>
+                    Auto
                   </button>
                 </div>
-                <input
-                  value={form.sku}
-                  onChange={(event) => setForm((current) => ({ ...current, sku: event.target.value }))}
-                  placeholder="e.g. CAP-593218"
-                  className={`w-full rounded-2xl border ${t.border} ${t.inputBg} px-3 py-2 text-base sm:text-sm outline-none transition-colors duration-200 ease-out focus:border-zinc-500 ${t.text}`}
-                />
               </div>
-              <div className="text-sm">
-                <span className={`mb-1.5 block ${t.textMuted}`}>Category</span>
+              <div>
+                <label className={`mb-1 block text-xs ${t.textMuted}`}>Category</label>
                 <CascadeSelect
                   value={form.category}
-                  onChange={(nextCategory) => setForm((current) => ({ ...current, category: nextCategory }))}
+                  onChange={(nextCategory) => setForm({ ...form, category: nextCategory })}
                   options={modalCategoryOptions}
                   darkMode={darkMode}
                   fullWidth
                 />
               </div>
-              <label className="text-sm">
-                <span className={`mb-1.5 block ${t.textMuted}`}>Size</span>
-                <input value={form.size} onChange={(event) => setForm((current) => ({ ...current, size: event.target.value }))} className={`w-full rounded-2xl border ${t.border} ${t.inputBg} px-3 py-2 text-base sm:text-sm outline-none transition-colors duration-200 ease-out focus:border-zinc-500 ${t.text}`} />
-              </label>
-              <label className="text-sm">
-                <span className={`mb-1.5 block ${t.textMuted}`}>Current Stock</span>
-                <input type="number" value={form.stock} onChange={(event) => setForm((current) => ({ ...current, stock: event.target.value }))} className={`w-full rounded-2xl border ${t.border} ${t.inputBg} px-3 py-2 text-base sm:text-sm tabular-nums outline-none transition-colors duration-200 ease-out focus:border-zinc-500 ${t.text}`} />
-              </label>
-              <label className="text-sm">
-                <span className={`mb-1.5 block ${t.textMuted}`}>Low Stock Threshold</span>
-                <input type="number" value={form.min} onChange={(event) => setForm((current) => ({ ...current, min: event.target.value }))} className={`w-full rounded-2xl border ${t.border} ${t.inputBg} px-3 py-2 text-base sm:text-sm tabular-nums outline-none transition-colors duration-200 ease-out focus:border-zinc-500 ${t.text}`} />
-              </label>
-            </div>
-
-            {form.sku.trim() && (
-              <div className="mt-4">
-                <div className="mb-1.5 flex items-center justify-between gap-2">
-                  <span className={`text-xs ${t.textMuted}`}>Custom Barcode Preview</span>
-                  <div className="inline-flex items-center gap-1 rounded-full border border-zinc-700/60 p-0.5 text-[11px]">
-                    <button
-                      type="button"
-                      onClick={() => setLabelFormat('compact')}
-                      className={`rounded-full px-2.5 py-0.5 font-semibold ${
-                        labelFormat === 'compact' ? t.tabActive : `${t.textMuted} hover:text-white`
-                      }`}
-                    >
-                      Compact
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setLabelFormat('full')}
-                      className={`rounded-full px-2.5 py-0.5 font-semibold ${
-                        labelFormat === 'full' ? t.tabActive : `${t.textMuted} hover:text-white`
-                      }`}
-                    >
-                      Full
-                    </button>
-                  </div>
-                </div>
-                <div
-                  className={`inline-flex flex-col items-center rounded-2xl bg-white text-black shadow-sm ${
-                    labelFormat === 'full' ? 'px-4 py-3 min-w-[230px]' : 'px-3 py-2'
-                  }`}
-                >
-                  {labelFormat === 'full' && (
-                    <span className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-zinc-600">
-                      {form.category || 'Item'} &bull; Size {form.size || '-'}
-                    </span>
-                  )}
-                  <div className="mb-1 flex items-center justify-center gap-1.5">
-                    <span className="text-xs font-extrabold tracking-wider text-black">
-                      {formatBarcodeItemSizeLabel(form.name, form.size)}
-                    </span>
-                    {renderLabelColorDots(form.colors)}
-                  </div>
-                  <Barcode
-                    value={form.sku.trim()}
-                    format="CODE128"
-                    height={labelFormat === 'full' ? 38 : 36}
-                    width={1.4}
-                    fontSize={12}
-                    margin={2}
-                  />
-                  {labelFormat === 'full' && form.colors.length > 0 && (
-                    <span className="mt-1 text-[10px] font-medium text-zinc-700">
-                      Colors: {form.colors.join(', ')}
-                    </span>
-                  )}
-                </div>
+              <div>
+                <label className={`mb-1 block text-xs ${t.textMuted}`}>Size / Type</label>
+                <input value={form.size} onChange={(event) => setForm({ ...form, size: event.target.value })} className={`w-full rounded-2xl border ${t.border} ${t.inputBg} px-3.5 py-2 text-base sm:text-sm outline-none ${t.text}`} />
               </div>
-            )}
-
-            <div className="mt-4">
-              <label className={`mb-2 block text-sm ${t.textMuted}`}>Colors</label>
-              <div className="flex flex-wrap items-center gap-2">
-                {allSelectableColors.map((color) => {
-                  const isSelected = form.colors.includes(color);
-                  return (
-                    <button
-                      key={color}
-                      type="button"
-                      onClick={() => toggleColor(color)}
-                      className={`tpd-click-press group flex items-center gap-2 rounded-full border px-3 sm:px-4 py-1.5 text-xs sm:text-sm transition-all duration-150 ease-out motion-reduce:transition-none hover:scale-105 ${
-                        isSelected
-                          ? `${t.tabActive} ${t.border} font-medium shadow-sm`
-                          : `${t.border} bg-transparent ${t.text} ${t.cardBgHover}`
-                      }`}
-                    >
-                      <ColorCircle color={color} size="sm" />
-                      <span>{color}</span>
-                    </button>
-                  );
-                })}
+              <div>
+                <label className={`mb-1 block text-xs ${t.textMuted}`}>Stock</label>
+                <input type="number" value={form.stock} onChange={(event) => setForm({ ...form, stock: event.target.value })} className={`w-full rounded-2xl border ${t.border} ${t.inputBg} px-3.5 py-2 text-base sm:text-sm tabular-nums outline-none ${t.text}`} />
               </div>
+              <div>
+                <label className={`mb-1 block text-xs ${t.textMuted}`}>Min Stock</label>
+                <input type="number" value={form.min} onChange={(event) => setForm({ ...form, min: event.target.value })} className={`w-full rounded-2xl border ${t.border} ${t.inputBg} px-3.5 py-2 text-base sm:text-sm tabular-nums outline-none ${t.text}`} />
+              </div>
+              <div className="sm:col-span-2">
+                <div className="flex items-center justify-between gap-2 mb-2">
+                  <label className={`block text-xs ${t.textMuted}`}>Colors</label>
+                  <button
+                    type="button"
+                    onClick={togglePickerAnimated}
+                    className={`tpd-click-press inline-flex items-center gap-1.5 rounded-full border ${t.btnSecondary} px-3 py-1 text-xs font-semibold`}
+                  >
+                    <Palette size={13} />
+                    <span>{isPickerOpen ? 'Hide Wheel' : 'Color Wheel'}</span>
+                  </button>
+                </div>
 
-              <div className="mt-3">
-                <button
-                  type="button"
-                  onClick={togglePickerAnimated}
-                  className={`tpd-click-press group inline-flex items-center gap-2 rounded-2xl border ${t.border} ${isPickerOpen ? t.cardBgHover : t.inputBg} px-3.5 py-2 text-xs sm:text-sm font-medium ${t.text} transition-all duration-150 ease-out motion-reduce:transition-none hover:scale-105`}
-                >
-                  <Palette size={15} className={`${iconClass} transition-transform duration-200 ease-out motion-reduce:transition-none group-hover:rotate-12`} />
-                  <span>Custom Color</span>
-                </button>
+                <div className="flex flex-wrap gap-2">
+                  {allSelectableColors.map((color) => {
+                    const active = form.colors.includes(color);
+                    return (
+                      <button
+                        key={color}
+                        type="button"
+                        onClick={() => toggleColor(color)}
+                        className={`group flex items-center gap-2 rounded-full border px-3 py-1.5 text-xs font-medium ${
+                          active ? t.tabActive : t.tabInactive
+                        }`}
+                      >
+                        <ColorCircle color={color} size="sm" />
+                        <span>{color}</span>
+                      </button>
+                    );
+                  })}
+                </div>
 
                 {isPickerOpen && (
                   <div
                     ref={customColorPanelRef}
-                    className={`${isPickerClosing ? 'tpd-pop-exit' : 'tpd-pop-enter'} mt-2.5 w-full max-w-xs rounded-3xl border ${t.border} ${t.cardBg} p-4 shadow-2xl transition-all duration-200 ease-out motion-reduce:transition-none`}
+                    className={`${isPickerClosing ? 'tpd-pop-exit' : 'tpd-pop-enter'} mt-3 rounded-2xl border ${t.border} ${t.cardBg3} p-3.5 space-y-3`}
                   >
-                    <div className={`flex items-center justify-between gap-2 pb-3 border-b ${t.border}`}>
-                      <div className="flex items-center gap-2.5 min-w-0">
-                        <ColorCircle color={pickerHex} size="lg" />
-                        <div className="min-w-0">
-                          <p className="text-sm font-bold truncate">{currentMatchedName}</p>
-                          <p className={`text-[11px] font-mono ${t.textMuted}`}>{pickerHex}</p>
-                        </div>
-                      </div>
-                      <div className="flex items-center gap-1 shrink-0">
-                        <button
-                          type="button"
-                          onClick={() => {
-                            addColorToForm(currentMatchedName);
-                            closePickerAnimated();
-                          }}
-                          title={`Add ${currentMatchedName}`}
-                          className={`tpd-click-press rounded-xl border ${t.btnPrimary} p-1.5 transition-all duration-150 hover:scale-110`}
-                        >
-                          <Check size={14} />
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => closePickerAnimated()}
-                          title="Close picker"
-                          className={`tpd-click-press rounded-xl border ${t.border} ${t.inputBg} p-1.5 ${t.textMuted} transition-all duration-150 hover:scale-110`}
-                        >
-                          <X size={14} />
-                        </button>
-                      </div>
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-xs font-bold">Color Wheel</span>
+                      <span className={`text-[11px] ${t.textMuted}`}>
+                        {previewSwatchName ? `Swatch: ${previewSwatchName}` : `Closest: ${currentMatchedName}`}
+                      </span>
+                    </div>
+
+                    <div className="grid grid-cols-6 gap-2">
+                      {FEATURED_SWATCHES.map((swatchName) => {
+                        const swatchHex = getColorFill(swatchName);
+                        const isPicked = form.colors.includes(swatchName);
+                        return (
+                          <button
+                            key={swatchName}
+                            type="button"
+                            onClick={() => {
+                              handleQuickSwatchSelect(swatchName);
+                              toggleColor(swatchName);
+                            }}
+                            title={swatchName}
+                            className={`tpd-click-press flex flex-col items-center gap-1 rounded-xl border p-1.5 text-[10px] ${
+                              isPicked ? t.tabActive : t.tabInactive
+                            }`}
+                          >
+                            <span
+                              className="h-5 w-5 rounded-full border border-black/40"
+                              style={{ backgroundColor: swatchHex }}
+                            />
+                            <span className="truncate w-full text-center">{swatchName}</span>
+                          </button>
+                        );
+                      })}
                     </div>
 
                     <div
                       onPointerDown={(e) => {
-                        e.currentTarget.setPointerCapture(e.pointerId);
-                        updateSvFromPointer(e.clientX, e.clientY, e.currentTarget.getBoundingClientRect());
+                        const rect = e.currentTarget.getBoundingClientRect();
+                        updateSvFromPointer(e.clientX, e.clientY, rect);
+                        const onMove = (moveEvent: PointerEvent) => {
+                          updateSvFromPointer(moveEvent.clientX, moveEvent.clientY, rect);
+                        };
+                        const onUp = () => {
+                          window.removeEventListener('pointermove', onMove);
+                          window.removeEventListener('pointerup', onUp);
+                        };
+                        window.addEventListener('pointermove', onMove);
+                        window.addEventListener('pointerup', onUp);
                       }}
-                      onPointerMove={(e) => {
-                        if (e.buttons !== 1 && e.pressure === 0) return;
-                        updateSvFromPointer(e.clientX, e.clientY, e.currentTarget.getBoundingClientRect());
-                      }}
-                      className={`mt-3.5 relative h-36 w-full cursor-crosshair rounded-2xl border ${t.border} select-none touch-none`}
+                      className="relative h-28 w-full cursor-crosshair rounded-xl border border-white/20 overflow-hidden touch-none"
                       style={{
                         backgroundColor: currentHueHex,
                         backgroundImage:
-                          'linear-gradient(to top, #000000, transparent), linear-gradient(to right, #ffffff, transparent)',
+                          'linear-gradient(to right, #ffffff, rgba(255,255,255,0)), linear-gradient(to top, #000000, rgba(0,0,0,0))',
                       }}
                     >
-                      <span
-                        className="pointer-events-none absolute h-4 w-4 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-white shadow-lg transition-transform duration-100"
+                      <div
+                        className="pointer-events-none absolute h-4 w-4 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-white shadow-md"
                         style={{
                           left: `${sat * 100}%`,
                           top: `${(1 - val) * 100}%`,
@@ -3764,15 +5946,19 @@ export default function InventoryDashboard() {
                       />
                     </div>
 
-                    <div className="mt-3">
+                    <div className="space-y-1">
+                      <div className="flex items-center justify-between text-[11px]">
+                        <span className={t.textMuted}>Hue</span>
+                        <span className="tabular-nums font-semibold">{Math.round(hue)}°</span>
+                      </div>
                       <input
                         type="range"
                         min={0}
                         max={360}
-                        value={hue}
+                        value={Math.round(hue)}
                         onChange={(e) => updateHueFromValue(Number(e.target.value))}
                         aria-label="Hue"
-                        className={`h-3 w-full cursor-pointer appearance-none rounded-full border ${t.border} transition-opacity duration-150 hover:opacity-95`}
+                        className="h-2.5 w-full cursor-pointer appearance-none rounded-full"
                         style={{
                           background:
                             'linear-gradient(to right, #ff0000 0%, #ffff00 17%, #00ff00 33%, #00ffff 50%, #0000ff 67%, #ff00ff 83%, #ff0000 100%)',
@@ -3780,297 +5966,82 @@ export default function InventoryDashboard() {
                       />
                     </div>
 
-                    <div className="mt-3.5">
-                      <p className={`mb-2 text-[11px] font-medium ${t.textMuted}`}>Quick Color Swatches (Click to preview, then tap &#10003; to add)</p>
-                      <div className="grid grid-cols-6 gap-2">
-                        {FEATURED_SWATCHES.map((swatchName) => {
-                          const isPreviewed = previewSwatchName === swatchName;
-                          return (
-                            <button
-                              key={swatchName}
-                              type="button"
-                              onClick={() => handleQuickSwatchSelect(swatchName)}
-                              title={`Preview ${swatchName}`}
-                              className={`tpd-click-press flex h-8 w-8 items-center justify-center rounded-full border transition-all duration-150 ease-out motion-reduce:transition-none hover:scale-110 ${
-                                isPreviewed ? 'ring-2 ring-white border-white scale-110' : `${t.border}`
-                              }`}
-                              style={{ backgroundColor: getColorFill(swatchName) }}
-                            >
-                              {isPreviewed && (
-                                <span
-                                  className={`h-2 w-2 rounded-full ${
-                                    ['White', 'Cream', 'Yellow', 'Lime', 'Cyan', 'Sky Blue', 'Silver'].includes(swatchName)
-                                      ? 'bg-black'
-                                      : 'bg-white'
-                                  }`}
-                                />
-                              )}
-                            </button>
-                          );
-                        })}
+                    <div className="flex items-center justify-between gap-2 pt-1">
+                      <div className="flex items-center gap-2 min-w-0">
+                        <span
+                          className="h-7 w-7 rounded-full border border-black/40 shrink-0"
+                          style={{ backgroundColor: pickerHex }}
+                        />
+                        <input
+                          value={pickerHex}
+                          onChange={(e) => {
+                            const raw = e.target.value.toUpperCase();
+                            setPickerHex(raw);
+                            setPreviewSwatchName(null);
+                            const rgb = hexToRgb(raw);
+                            if (rgb) {
+                              const hsv = rgbToHsv(rgb.r, rgb.g, rgb.b);
+                              setHue(hsv.h);
+                              setSat(hsv.s);
+                              setVal(hsv.v);
+                            }
+                          }}
+                          aria-label="Hex color value"
+                          className={`w-24 rounded-xl border ${t.border} ${t.inputBg} px-2.5 py-1 text-base sm:text-xs font-mono uppercase outline-none ${t.text}`}
+                        />
+                        <span className={`text-xs font-medium truncate ${t.textMuted}`}>
+                          {previewSwatchName || currentMatchedName}
+                        </span>
+                      </div>
+
+                      <div className="flex items-center gap-1.5 shrink-0">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            addColorToForm(previewSwatchName || currentMatchedName);
+                            closePickerAnimated();
+                          }}
+                          className={`tpd-click-press rounded-xl border ${t.btnSecondary} px-2.5 py-1.5 text-xs font-semibold`}
+                        >
+                          + {previewSwatchName || currentMatchedName}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            addColorToForm(pickerHex);
+                            closePickerAnimated();
+                          }}
+                          className={`tpd-click-press rounded-xl border ${t.btnPrimary} px-2.5 py-1.5 text-xs font-semibold`}
+                        >
+                          + Hex
+                        </button>
                       </div>
                     </div>
                   </div>
                 )}
               </div>
             </div>
-
             <div className="mt-6 flex justify-end gap-3">
-              <button onClick={closeModalAnimated} className={`rounded-2xl border ${t.btnSecondary} px-4 py-2 text-sm transition-all duration-200 ease-out motion-reduce:transition-none`}>Cancel</button>
+              <button onClick={closeModalAnimated} className={`rounded-2xl border ${t.border} ${t.btnSecondary} px-4 py-2 text-sm`}>Cancel</button>
               <button
                 type="button"
                 onClick={submitItem}
                 disabled={isSavingItem}
-                className={`inline-flex items-center gap-1.5 rounded-2xl border ${t.btnPrimary} px-4 py-2 text-sm font-semibold transition-all duration-200 ease-out motion-reduce:transition-none disabled:opacity-70`}
+                className={`inline-flex items-center justify-center gap-2 rounded-2xl border ${t.btnPrimary} px-5 py-2 text-sm font-semibold disabled:opacity-70`}
               >
                 {saveSuccess ? (
                   <>
-                    <Check size={15} strokeWidth={3} className="tpd-check-pop text-emerald-500" />
+                    <Check size={16} strokeWidth={3} className={t.successText} />
                     <span>Saved</span>
                   </>
                 ) : (
-                  <span>{isSavingItem ? 'Saving...' : 'Save'}</span>
+                  <span>{isSavingItem ? 'Saving...' : editingId ? 'Save Changes' : 'Create Item'}</span>
                 )}
               </button>
             </div>
           </div>
         </div>
       )}
-
-      <style jsx>{`
-        .tpd-click-press {
-          transition: transform 200ms cubic-bezier(0.22, 1, 0.36, 1), background-color 180ms ease, box-shadow 180ms ease, border-color 180ms ease, opacity 160ms ease;
-        }
-        .tpd-click-press:active {
-          transform: scale(0.94);
-          transition-duration: 110ms;
-        }
-        .tpd-cascade-panel-enter {
-          animation: tpdCascadePanelIn 200ms cubic-bezier(0.22, 1, 0.36, 1) both;
-          transform-origin: top center;
-        }
-        .tpd-cascade-panel-exit {
-          animation: tpdCascadePanelOut 180ms cubic-bezier(0.22, 1, 0.36, 1) both;
-          transform-origin: top center;
-        }
-        .tpd-cascade-item-enter {
-          animation: tpdCascadeItemIn 220ms cubic-bezier(0.22, 1, 0.36, 1) both;
-        }
-        .tpd-cascade-item-exit {
-          animation: tpdCascadeItemOut 160ms cubic-bezier(0.22, 1, 0.36, 1) both;
-        }
-        .tpd-cascade-option {
-          position: relative;
-          z-index: 1;
-          transition: transform 200ms cubic-bezier(0.22, 1, 0.36, 1), background-color 180ms ease, border-color 180ms ease, box-shadow 180ms ease, color 160ms ease;
-        }
-        .tpd-cascade-option:hover {
-          z-index: 10;
-          transform: scale(1.045);
-          box-shadow: 0 10px 22px -8px rgba(0, 0, 0, 0.55);
-        }
-        .tpd-cascade-option:active {
-          transform: scale(0.97);
-          transition-duration: 100ms;
-        }
-        .tpd-fade-enter {
-          animation: tpdFadeIn 200ms cubic-bezier(0.22, 1, 0.36, 1) both;
-        }
-        .tpd-fade-exit {
-          animation: tpdFadeOut 180ms cubic-bezier(0.22, 1, 0.36, 1) both;
-        }
-        .tpd-modal-enter {
-          animation: tpdModalIn 250ms cubic-bezier(0.22, 1, 0.36, 1) both;
-        }
-        .tpd-modal-exit {
-          animation: tpdModalOut 180ms cubic-bezier(0.22, 1, 0.36, 1) both;
-        }
-        .tpd-pop-enter {
-          animation: tpdPopIn 220ms cubic-bezier(0.22, 1, 0.36, 1) both;
-        }
-        .tpd-pop-exit {
-          animation: tpdPopOut 180ms cubic-bezier(0.22, 1, 0.36, 1) both;
-        }
-        .tpd-msg-top-enter {
-          animation: tpdMsgTopIn 260ms cubic-bezier(0.22, 1, 0.36, 1) both;
-        }
-        .tpd-msg-top-exit {
-          animation: tpdMsgTopOut 180ms cubic-bezier(0.22, 1, 0.36, 1) both;
-        }
-        .tpd-check-pop {
-          animation: tpdCheckPop 240ms cubic-bezier(0.22, 1, 0.36, 1) both;
-        }
-        .tpd-scan-success {
-          animation: tpdScanSuccess 280ms cubic-bezier(0.22, 1, 0.36, 1) both;
-        }
-        @keyframes tpdCascadePanelIn {
-          from {
-            opacity: 0;
-            transform: translateY(-6px) scaleY(0.95);
-          }
-          to {
-            opacity: 1;
-            transform: translateY(0) scaleY(1);
-          }
-        }
-        @keyframes tpdCascadePanelOut {
-          from {
-            opacity: 1;
-            transform: translateY(0) scaleY(1);
-          }
-          to {
-            opacity: 0;
-            transform: translateY(-5px) scaleY(0.96);
-          }
-        }
-        @keyframes tpdCascadeItemIn {
-          from {
-            opacity: 0;
-            transform: translateY(-6px) scale(0.96);
-          }
-          to {
-            opacity: 1;
-            transform: translateY(0) scale(1);
-          }
-        }
-        @keyframes tpdCascadeItemOut {
-          from {
-            opacity: 1;
-            transform: translateY(0) scale(1);
-          }
-          to {
-            opacity: 0;
-            transform: translateY(-5px) scale(0.96);
-          }
-        }
-        @keyframes tpdFadeIn {
-          from {
-            opacity: 0;
-          }
-          to {
-            opacity: 1;
-          }
-        }
-        @keyframes tpdFadeOut {
-          from {
-            opacity: 1;
-          }
-          to {
-            opacity: 0;
-          }
-        }
-        @keyframes tpdModalIn {
-          from {
-            opacity: 0;
-            transform: translateY(12px) scale(0.97);
-          }
-          to {
-            opacity: 1;
-            transform: translateY(0) scale(1);
-          }
-        }
-        @keyframes tpdModalOut {
-          from {
-            opacity: 1;
-            transform: translateY(0) scale(1);
-          }
-          to {
-            opacity: 0;
-            transform: translateY(10px) scale(0.97);
-          }
-        }
-        @keyframes tpdPopIn {
-          from {
-            opacity: 0;
-            transform: translateY(-6px) scale(0.97);
-          }
-          to {
-            opacity: 1;
-            transform: translateY(0) scale(1);
-          }
-        }
-        @keyframes tpdPopOut {
-          from {
-            opacity: 1;
-            transform: translateY(0) scale(1);
-          }
-          to {
-            opacity: 0;
-            transform: translateY(-6px) scale(0.97);
-          }
-        }
-        @keyframes tpdMsgTopIn {
-          from {
-            opacity: 0;
-            transform: translateY(-20px) scale(0.95);
-          }
-          to {
-            opacity: 1;
-            transform: translateY(0) scale(1);
-          }
-        }
-        @keyframes tpdMsgTopOut {
-          from {
-            opacity: 1;
-            transform: translateY(0) scale(1);
-          }
-          to {
-            opacity: 0;
-            transform: translateY(-16px) scale(0.96);
-          }
-        }
-        @keyframes tpdCheckPop {
-          0% {
-            transform: scale(0.3) rotate(-25deg);
-            opacity: 0;
-          }
-          70% {
-            transform: scale(1.25) rotate(4deg);
-            opacity: 1;
-          }
-          100% {
-            transform: scale(1) rotate(0deg);
-            opacity: 1;
-          }
-        }
-        @keyframes tpdScanSuccess {
-          0% {
-            opacity: 0;
-            transform: scale(0.94) translateY(-4px);
-          }
-          65% {
-            opacity: 1;
-            transform: scale(1.02) translateY(0);
-          }
-          100% {
-            opacity: 1;
-            transform: scale(1) translateY(0);
-          }
-        }
-        @media (prefers-reduced-motion: reduce) {
-          .tpd-click-press,
-          .tpd-click-press:active,
-          .tpd-cascade-panel-enter,
-          .tpd-cascade-panel-exit,
-          .tpd-cascade-item-enter,
-          .tpd-cascade-item-exit,
-          .tpd-cascade-option,
-          .tpd-cascade-option:hover,
-          .tpd-fade-enter,
-          .tpd-fade-exit,
-          .tpd-modal-enter,
-          .tpd-modal-exit,
-          .tpd-pop-enter,
-          .tpd-pop-exit,
-          .tpd-msg-top-enter,
-          .tpd-msg-top-exit,
-          .tpd-check-pop,
-          .tpd-scan-success {
-            animation: none !important;
-            transform: none !important;
-          }
-        }
-      `}</style>
     </main>
   );
 }
