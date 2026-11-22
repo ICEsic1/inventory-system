@@ -4,6 +4,7 @@ import backgroundImg from '../Background.png';
 import { supabase } from './supabase';
 import type { User } from '@supabase/supabase-js';
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import Barcode from 'react-barcode';
 import {
   AlertTriangle,
@@ -15,9 +16,10 @@ import {
   CheckCheck,
   ChevronDown,
   ChevronUp,
-  Copy,
   Download,
   Edit3,
+  Eye,
+  EyeOff,
   FileText,
   Layers,
   List,
@@ -97,6 +99,7 @@ type StockDocumentLine = {
   sku: string;
   category: string;
   size: string;
+  min?: number;
   colors: string[];
   qty: number;
   isNewCatalogItem?: boolean;
@@ -139,6 +142,10 @@ const UNIT_ESTIMATED_PRICE = 80;
 const colorOptions = ['Black', 'White', 'Navy', 'Olive', 'Cream', 'Red', 'Khaki'];
 const DEFAULT_SUPPLIERS = ['Select', 'Metro Print Supply', 'Cebu Apparel Wholesaler', 'Pacific Paper & Ink', 'Direct Factory', 'Custom'];
 const DEFAULT_CUSTOMERS = ['Select', 'Walk-in Customer', 'Corporate Client', 'Event Organizer', 'Retail Partner', 'Custom'];
+
+function isGmailAddress(email: string): boolean {
+  return /^[^\s@]+@gmail\.com$/i.test(email.trim());
+}
 
 function formatCurrentDocDateTime(): string {
   const now = new Date();
@@ -427,87 +434,49 @@ function playScanFeedbackChime(success = true, doubleBeep = false) {
         osc.type = 'sawtooth';
         osc.frequency.setValueAtTime(310, now);
         gain.gain.setValueAtTime(0.45, now);
-        gain.gain.exponentialRampToValueAtTime(0.001, now + 0.26);
+        gain.gain.exponentialRampToValueAtTime(0.001, now + 0.24);
         osc.connect(gain);
         gain.connect(ctx.destination);
         osc.start(now);
-        osc.stop(now + 0.26);
-        setTimeout(() => {
-          osc.disconnect();
-          gain.disconnect();
-        }, 300);
+        osc.stop(now + 0.24);
       } else if (doubleBeep) {
-        const beepDuration = 0.11;
-        const gap = 0.08;
+        const beepDuration = 0.1;
+        const gap = 0.07;
         [0, beepDuration + gap].forEach((offset) => {
           const startAt = now + offset;
           const oscPrimary = ctx.createOscillator();
-          const oscHarmonic = ctx.createOscillator();
           const gain = ctx.createGain();
-
           oscPrimary.type = 'square';
-          oscHarmonic.type = 'square';
           oscPrimary.frequency.setValueAtTime(1567.98, startAt);
-          oscHarmonic.frequency.setValueAtTime(3135.96, startAt);
-
-          gain.gain.setValueAtTime(0.85, startAt);
+          gain.gain.setValueAtTime(0.8, startAt);
           gain.gain.exponentialRampToValueAtTime(0.01, startAt + beepDuration);
-
           oscPrimary.connect(gain);
-          oscHarmonic.connect(gain);
           gain.connect(ctx.destination);
-
           oscPrimary.start(startAt);
-          oscHarmonic.start(startAt);
           oscPrimary.stop(startAt + beepDuration);
-          oscHarmonic.stop(startAt + beepDuration);
-          setTimeout(() => {
-            oscPrimary.disconnect();
-            oscHarmonic.disconnect();
-            gain.disconnect();
-          }, (offset + beepDuration) * 1000 + 60);
         });
       } else {
-        const duration = 0.18;
+        const duration = 0.16;
         const oscPrimary = ctx.createOscillator();
-        const oscHarmonic = ctx.createOscillator();
         const gain = ctx.createGain();
-
         oscPrimary.type = 'square';
-        oscHarmonic.type = 'square';
         oscPrimary.frequency.setValueAtTime(1567.98, now);
-        oscHarmonic.frequency.setValueAtTime(3135.96, now);
-
-        gain.gain.setValueAtTime(0.85, now);
+        gain.gain.setValueAtTime(0.8, now);
         gain.gain.exponentialRampToValueAtTime(0.01, now + duration);
-
         oscPrimary.connect(gain);
-        oscHarmonic.connect(gain);
         gain.connect(ctx.destination);
-
         oscPrimary.start(now);
-        oscHarmonic.start(now);
         oscPrimary.stop(now + duration);
-        oscHarmonic.stop(now + duration);
-        setTimeout(() => {
-          oscPrimary.disconnect();
-          oscHarmonic.disconnect();
-          gain.disconnect();
-        }, 240);
       }
     }
 
     if (typeof navigator !== 'undefined' && typeof navigator.vibrate === 'function') {
-      if (!success) {
-        navigator.vibrate([50, 40, 50]);
-      } else if (doubleBeep) {
-        navigator.vibrate([90, 70, 90]);
-      } else {
-        navigator.vibrate(140);
-      }
+      if (!success) navigator.vibrate([45, 35, 45]);
+      else if (doubleBeep) navigator.vibrate([80, 60, 80]);
+      else navigator.vibrate(120);
     }
   } catch {
-    // Ignore audio/vibration errors on restricted browsers
+    // Ignore audio/vibration errors
   }
 }
 
@@ -531,6 +500,15 @@ function escapeHtml(text: string): string {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
+}
+
+function sanitizePdfText(input: string): string {
+  return input
+    .replace(/[^\x20-\x7E]/g, ' ')
+    .replace(/\\/g, '\\\\')
+    .replace(/\(/g, '\\(')
+    .replace(/\)/g, '\\)')
+    .slice(0, 110);
 }
 
 function buildSingleBarcodeCardHtml(
@@ -587,88 +565,24 @@ function openPrintWindowWithCards(titleText: string, cardsHtml: string) {
       <head>
         <title>${escapeHtml(titleText)}</title>
         <style>
-          body {
-            font-family: Arial, sans-serif;
-            margin: 0;
-            padding: 12px;
-            background: #ffffff;
-            color: #000000;
-          }
-          .sheet {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 10px;
-            align-items: flex-start;
-            justify-content: flex-start;
-          }
-          .label-card {
-            border: 1px solid #d4d4d8;
-            border-radius: 8px;
-            padding: 8px 10px;
-            background: #ffffff;
-            display: inline-flex;
-            flex-direction: column;
-            align-items: center;
-            box-sizing: border-box;
-            break-inside: avoid;
-          }
-          .label-compact {
-            min-width: 170px;
-          }
-          .label-full {
-            min-width: 230px;
-            padding: 10px 12px;
-          }
-          .top-meta {
-            font-size: 10px;
-            color: #3f3f46;
-            margin-bottom: 4px;
-            text-align: center;
-          }
-          .item-row {
-            display: inline-flex;
-            align-items: center;
-            justify-content: center;
-            gap: 6px;
-            margin-bottom: 4px;
-          }
-          .item-mark {
-            font-size: 12px;
-            font-weight: 800;
-            letter-spacing: 0.06em;
-            color: #000000;
-          }
-          .color-dots {
-            display: inline-flex;
-            align-items: center;
-            gap: 4px;
-          }
-          .color-dot {
-            display: inline-block;
-            width: 11px;
-            height: 11px;
-            border-radius: 9999px;
-            border: 1px solid #27272a;
-          }
-          .barcode-box {
-            display: flex;
-            justify-content: center;
-          }
-          .color-names {
-            margin-top: 4px;
-            font-size: 10px;
-            color: #27272a;
-            text-align: center;
-          }
+          body { font-family: Arial, sans-serif; margin: 0; padding: 12px; background: #ffffff; color: #000000; }
+          .sheet { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-start; justify-content: flex-start; }
+          .label-card { border: 1px solid #d4d4d8; border-radius: 8px; padding: 8px 10px; background: #ffffff; display: inline-flex; flex-direction: column; align-items: center; box-sizing: border-box; break-inside: avoid; }
+          .label-compact { min-width: 170px; }
+          .label-full { min-width: 230px; padding: 10px 12px; }
+          .top-meta { font-size: 10px; color: #3f3f46; margin-bottom: 4px; text-align: center; }
+          .item-row { display: inline-flex; align-items: center; justify-content: center; gap: 6px; margin-bottom: 4px; }
+          .item-mark { font-size: 12px; font-weight: 800; letter-spacing: 0.06em; color: #000000; }
+          .color-dots { display: inline-flex; align-items: center; gap: 4px; }
+          .color-dot { display: inline-block; width: 11px; height: 11px; border-radius: 9999px; border: 1px solid #27272a; }
+          .barcode-box { display: flex; justify-content: center; }
+          .color-names { margin-top: 4px; font-size: 10px; color: #27272a; text-align: center; }
         </style>
       </head>
       <body>
         <div class="sheet">${cardsHtml}</div>
         <script>
-          window.onload = function () {
-            window.print();
-            window.close();
-          };
+          window.onload = function () { window.print(); window.close(); };
         </script>
       </body>
     </html>
@@ -676,14 +590,13 @@ function openPrintWindowWithCards(titleText: string, cardsHtml: string) {
   printWin.document.close();
 }
 
-function openInventoryPdfReport(
+function downloadInventoryPdf(
   reportTitle: string,
   subtitle: string,
-  sourceItems: InventoryItem[]
+  sourceItems: InventoryItem[],
+  fileSlug: string
 ) {
-  if (typeof window === 'undefined') return;
-  const printWin = window.open('', '_blank', 'width=900,height=680');
-  if (!printWin) return;
+  if (typeof window === 'undefined' || typeof document === 'undefined') return;
 
   const totalUnits = sourceItems.reduce((sum, item) => sum + item.stock, 0);
   const totalEstValue = sourceItems.reduce((sum, item) => sum + item.stock * UNIT_ESTIMATED_PRICE, 0);
@@ -692,208 +605,75 @@ function openInventoryPdfReport(
   ).length;
   const generatedAt = new Date().toLocaleString();
 
-  const rowsHtml =
-    sourceItems.length === 0
-      ? `<tr><td colspan="8" style="text-align:center;padding:18px;color:#64748b;">No inventory items in this selection.</td></tr>`
-      : sourceItems
-          .map((item) => {
-            const statusColor =
-              item.status === 'OUT OF STOCK'
-                ? 'background:#fee2e2;color:#991b1b;border:1px solid #fca5a5;'
-                : item.status === 'LOW'
-                  ? 'background:#fef3c7;color:#92400e;border:1px solid #fcd34d;'
-                  : 'background:#dcfce7;color:#166534;border:1px solid #86efac;';
+  const lines: string[] = [
+    'THE PRINTING DEPOT - INVENTORY EXPORT',
+    sanitizePdfText(reportTitle),
+    sanitizePdfText(subtitle),
+    sanitizePdfText(`Generated: ${generatedAt}`),
+    sanitizePdfText(
+      `Items: ${sourceItems.length} | Total Units: ${totalUnits} | Est. Value: PHP ${totalEstValue.toLocaleString()} | Low/Out: ${lowOrOutCount}`
+    ),
+    '------------------------------------------------------------------------',
+  ];
 
-            const colorDots = (item.colors || [])
-              .map(
-                (c) =>
-                  `<span style="display:inline-flex;align-items:center;gap:4px;margin-right:6px;"><span style="display:inline-block;width:9px;height:9px;border-radius:999px;background:${escapeHtml(
-                    getColorFill(c)
-                  )};border:1px solid #3f3f46;"></span>${escapeHtml(c)}</span>`
-              )
-              .join('');
+  if (sourceItems.length === 0) {
+    lines.push('No inventory items in this export.');
+  } else {
+    sourceItems.forEach((item, idx) => {
+      const colorsStr = (item.colors || []).join(', ') || '-';
+      lines.push(
+        sanitizePdfText(
+          `${idx + 1}. ${item.name} | SKU: ${item.sku || '-'} | Cat: ${item.category || '-'} | Size: ${item.size || '-'} | Stock: ${item.stock}/${item.min} | ${item.status} | Colors: ${colorsStr}`
+        )
+      );
+    });
+  }
 
-            return `
-              <tr>
-                <td style="font-weight:700;">${escapeHtml(item.name)}</td>
-                <td style="font-family:monospace;font-size:11px;">${escapeHtml(item.sku || '-')}</td>
-                <td>${escapeHtml(item.category || '-')}</td>
-                <td>${escapeHtml(item.size || '-')}</td>
-                <td>${colorDots || '<span style="color:#94a3b8;">-</span>'}</td>
-                <td style="text-align:right;font-weight:700;">${item.stock}</td>
-                <td style="text-align:right;">${item.min}</td>
-                <td style="text-align:center;"><span style="display:inline-block;padding:2px 8px;border-radius:999px;font-size:10px;font-weight:700;${statusColor}">${escapeHtml(
-                  item.status
-                )}</span></td>
-              </tr>
-            `;
-          })
-          .join('');
+  const streamOps: string[] = ['BT', '/F1 10 Tf', '40 760 Td', '14 TL'];
+  lines.slice(0, 48).forEach((line, i) => {
+    if (i > 0) streamOps.push('T*');
+    streamOps.push(`(${sanitizePdfText(line)}) Tj`);
+  });
+  streamOps.push('ET');
+  const contentStream = streamOps.join('\n');
 
-  printWin.document.write(`
-    <html>
-      <head>
-        <title>${escapeHtml(reportTitle)} - THE PRINTING DEPOT</title>
-        <style>
-          @page {
-            size: A4 portrait;
-            margin: 14mm;
-          }
-          body {
-            font-family: Arial, Helvetica, sans-serif;
-            margin: 0;
-            color: #0f172a;
-            background: #ffffff;
-          }
-          .header {
-            display: flex;
-            justify-content: space-between;
-            align-items: flex-start;
-            border-bottom: 2px solid #0f172a;
-            padding-bottom: 10px;
-            margin-bottom: 14px;
-          }
-          .brand {
-            font-size: 10px;
-            font-weight: 800;
-            letter-spacing: 0.16em;
-            text-transform: uppercase;
-            color: #475569;
-          }
-          .title {
-            font-size: 20px;
-            font-weight: 900;
-            margin: 2px 0;
-          }
-          .subtitle {
-            font-size: 12px;
-            color: #334155;
-          }
-          .meta {
-            text-align: right;
-            font-size: 11px;
-            color: #475569;
-          }
-          .summary {
-            display: grid;
-            grid-template-columns: repeat(4, 1fr);
-            gap: 8px;
-            margin-bottom: 14px;
-          }
-          .stat-box {
-            border: 1px solid #cbd5e1;
-            border-radius: 8px;
-            padding: 8px 10px;
-            background: #f8fafc;
-          }
-          .stat-label {
-            font-size: 10px;
-            text-transform: uppercase;
-            color: #64748b;
-            font-weight: 700;
-          }
-          .stat-val {
-            font-size: 15px;
-            font-weight: 800;
-            margin-top: 2px;
-          }
-          table {
-            width: 100%;
-            border-collapse: collapse;
-            font-size: 11.5px;
-          }
-          th {
-            background: #0f172a;
-            color: #ffffff;
-            text-align: left;
-            padding: 7px 8px;
-            font-size: 10.5px;
-            text-transform: uppercase;
-            letter-spacing: 0.04em;
-          }
-          td {
-            padding: 6px 8px;
-            border-bottom: 1px solid #e2e8f0;
-            vertical-align: middle;
-          }
-          tr:nth-child(even) td {
-            background: #f8fafc;
-          }
-          tr {
-            break-inside: avoid;
-          }
-        </style>
-      </head>
-      <body>
-        <div class="header">
-          <div>
-            <div class="brand">THE PRINTING DEPOT • INVENTORY REPORT</div>
-            <div class="title">${escapeHtml(reportTitle)}</div>
-            <div class="subtitle">${escapeHtml(subtitle)}</div>
-          </div>
-          <div class="meta">
-            <div><strong>Generated:</strong> ${escapeHtml(generatedAt)}</div>
-            <div><strong>Total Records:</strong> ${sourceItems.length}</div>
-          </div>
-        </div>
+  const pdfObjects = [
+    '1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj',
+    '2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj',
+    '3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >> endobj',
+    '4 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj',
+    `5 0 obj << /Length ${contentStream.length} >> stream\n${contentStream}\nendstream endobj`,
+  ];
 
-        <div class="summary">
-          <div class="stat-box">
-            <div class="stat-label">Items Listed</div>
-            <div class="stat-val">${sourceItems.length}</div>
-          </div>
-          <div class="stat-box">
-            <div class="stat-label">Total Stock Units</div>
-            <div class="stat-val">${totalUnits}</div>
-          </div>
-          <div class="stat-box">
-            <div class="stat-label">Est. Value</div>
-            <div class="stat-val">₱${totalEstValue.toLocaleString()}</div>
-          </div>
-          <div class="stat-box">
-            <div class="stat-label">Low / Out Stock</div>
-            <div class="stat-val">${lowOrOutCount}</div>
-          </div>
-        </div>
+  let pdfBody = '%PDF-1.4\n';
+  const offsets: number[] = [0];
+  for (const obj of pdfObjects) {
+    offsets.push(pdfBody.length);
+    pdfBody += `${obj}\n`;
+  }
 
-        <table>
-          <thead>
-            <tr>
-              <th>Item Name</th>
-              <th>SKU</th>
-              <th>Category</th>
-              <th>Size / Type</th>
-              <th>Colors</th>
-              <th style="text-align:right;">Stock</th>
-              <th style="text-align:right;">Min</th>
-              <th style="text-align:center;">Status</th>
-            </tr>
-          </thead>
-          <tbody>
-            ${rowsHtml}
-          </tbody>
-        </table>
+  const xrefStart = pdfBody.length;
+  pdfBody += `xref\n0 ${pdfObjects.length + 1}\n`;
+  pdfBody += '0000000000 65535 f \n';
+  for (let i = 1; i <= pdfObjects.length; i++) {
+    pdfBody += `${String(offsets[i]).padStart(10, '0')} 00000 n \n`;
+  }
+  pdfBody += `trailer << /Size ${pdfObjects.length + 1} /Root 1 0 R >>\nstartxref\n${xrefStart}\n%%EOF`;
 
-        <script>
-          window.onload = function () {
-            window.print();
-            window.close();
-          };
-        </script>
-      </body>
-    </html>
-  `);
-  printWin.document.close();
+  const blob = new Blob([pdfBody], { type: 'application/pdf' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = `printing-depot-${fileSlug}.pdf`;
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 function FrostedBackgroundLayer({ darkMode }: { darkMode: boolean }) {
   return (
-    <div
-      aria-hidden="true"
-      className="pointer-events-none fixed inset-0 z-0 overflow-hidden"
-    >
+    <div aria-hidden="true" className="pointer-events-none fixed inset-0 z-0 overflow-hidden">
       <div
-        className="h-full w-full scale-105 bg-cover bg-center bg-no-repeat transition-all duration-500"
+        className="h-full w-full scale-105 bg-cover bg-center bg-no-repeat transition-opacity duration-200"
         style={{
           backgroundImage: `url('${backgroundImg.src}')`,
           filter: darkMode
@@ -920,20 +700,30 @@ function ColorCircle({ color, size = 'sm' }: { color: string; size?: 'sm' | 'md'
 
   return (
     <span
-      className={`inline-block rounded-full border border-zinc-400/60 shrink-0 transition-transform duration-300 ease-out motion-reduce:transition-none group-hover:scale-110 ${sizeClass}`}
+      className={`inline-block rounded-full border border-zinc-400/60 shrink-0 transition-transform duration-150 ease-out motion-reduce:transition-none group-hover:scale-110 ${sizeClass}`}
       style={{ backgroundColor: fill, minWidth: minPx, minHeight: minPx }}
       aria-hidden="true"
     />
   );
 }
 
-function PrintingDepotLogo({ darkMode, size = 'md' }: { darkMode: boolean; size?: 'sm' | 'md' }) {
-  const boxSize = size === 'sm' ? 'h-10 w-10 rounded-2xl' : 'h-12 w-12 rounded-2xl';
-  const imgSize = size === 'sm' ? 'h-6 w-6' : 'h-7 w-7';
+function PrintingDepotLogo({
+  darkMode,
+  size = 'md',
+  spinning = false,
+}: {
+  darkMode: boolean;
+  size?: 'sm' | 'md';
+  spinning?: boolean;
+}) {
+  const boxSize =
+    size === 'sm'
+      ? 'h-14 w-14 sm:h-16 sm:w-16 rounded-2xl p-0 m-0'
+      : 'h-16 w-16 sm:h-20 sm:w-20 rounded-2xl p-0 m-0';
 
   return (
     <div
-      className={`tpd-logo-mark tpd-click-press relative flex ${boxSize} shrink-0 items-center justify-center overflow-hidden border backdrop-blur-xl saturate-150 transition-transform duration-300 ease-out motion-reduce:transition-none hover:scale-105 ${
+      className={`tpd-logo-mark tpd-click-press relative flex ${boxSize} shrink-0 items-center justify-center overflow-hidden border backdrop-blur-xl saturate-150 ${
         darkMode
           ? 'border-white/20 bg-white/10 text-white shadow-md ring-1 ring-inset ring-white/10'
           : 'border-black/15 bg-white/55 text-black shadow-sm ring-1 ring-inset ring-black/5'
@@ -942,7 +732,7 @@ function PrintingDepotLogo({ darkMode, size = 'md' }: { darkMode: boolean; size?
       <img
         src="/icon.png"
         alt="The Printing Depot logo"
-        className={`${imgSize} object-contain`}
+        className={`h-full w-full p-0 m-0 object-cover ${spinning ? 'animate-spin' : ''}`}
       />
     </div>
   );
@@ -988,121 +778,154 @@ function CascadeSelect({
   minWidthClass?: string;
 }) {
   const [open, setOpen] = useState(false);
-  const [closing, setClosing] = useState(false);
+  const [coords, setCoords] = useState<{ top: number; left: number; width: number }>({
+    top: 0,
+    left: 0,
+    width: 210,
+  });
   const containerRef = useRef<HTMLDivElement | null>(null);
+  const buttonRef = useRef<HTMLButtonElement | null>(null);
+  const menuPortalRef = useRef<HTMLDivElement | null>(null);
 
   const selectedOption = options.find((opt) => opt.value === value) || options[0];
 
-  const closeMenu = () => {
-    if (!open || closing) return;
-    setClosing(true);
-    setTimeout(() => {
-      setOpen(false);
-      setClosing(false);
-    }, 240);
+  const updateMenuPosition = () => {
+    const btn = buttonRef.current;
+    if (!btn || typeof window === 'undefined') return;
+    const rect = btn.getBoundingClientRect();
+    const menuWidth = fullWidth ? Math.max(rect.width, 190) : Math.max(rect.width, 210);
+    const viewportW = window.innerWidth;
+    const viewportH = window.innerHeight;
+    const clampedLeft = Math.max(12, Math.min(rect.left, viewportW - menuWidth - 12));
+    const estimatedHeight = Math.min(options.length * 40 + 16, 260);
+    const openAbove = rect.bottom + estimatedHeight + 10 > viewportH && rect.top > estimatedHeight + 12;
+    const topPos = openAbove
+      ? Math.max(12, rect.top - estimatedHeight - 6)
+      : Math.min(viewportH - 12, rect.bottom + 6);
+
+    setCoords({
+      top: topPos,
+      left: clampedLeft,
+      width: menuWidth,
+    });
   };
 
   const toggleMenu = () => {
     if (open) {
-      closeMenu();
+      setOpen(false);
     } else {
-      setClosing(false);
+      updateMenuPosition();
       setOpen(true);
     }
   };
 
   useEffect(() => {
     if (!open) return;
+    updateMenuPosition();
 
     const handlePointerDown = (event: MouseEvent) => {
-      if (containerRef.current && !containerRef.current.contains(event.target as Node)) {
-        closeMenu();
+      const target = event.target as Node;
+      const insideTrigger = containerRef.current?.contains(target);
+      const insideMenu = menuPortalRef.current?.contains(target);
+      if (!insideTrigger && !insideMenu) {
+        setOpen(false);
       }
     };
 
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
-        closeMenu();
+        setOpen(false);
       }
+    };
+
+    const handleReposition = () => {
+      updateMenuPosition();
     };
 
     document.addEventListener('mousedown', handlePointerDown);
     window.addEventListener('keydown', handleKeyDown);
+    window.addEventListener('resize', handleReposition);
+    window.addEventListener('scroll', handleReposition, true);
     return () => {
       document.removeEventListener('mousedown', handlePointerDown);
       window.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('resize', handleReposition);
+      window.removeEventListener('scroll', handleReposition, true);
     };
-  }, [open, closing]);
+  }, [open, fullWidth, options.length]);
 
   const triggerStyle = darkMode
-    ? 'border-white/20 bg-zinc-900/40 text-white backdrop-blur-xl saturate-150 ring-1 ring-inset ring-white/10 hover:border-white/35 hover:bg-zinc-900/55'
-    : 'border-black/20 bg-white/80 text-zinc-950 backdrop-blur-xl saturate-150 ring-1 ring-inset ring-black/5 hover:border-black/35 hover:bg-white';
+    ? 'border-white/20 bg-zinc-900/55 text-white backdrop-blur-xl saturate-150 ring-1 ring-inset ring-white/10 hover:border-white/35 hover:bg-zinc-900/75'
+    : 'border-black/20 bg-white/80 text-zinc-950 backdrop-blur-xl saturate-150 ring-1 ring-inset ring-white/70 hover:border-black/35 hover:bg-white/95';
 
   const menuStyle = darkMode
-    ? 'border-white/20 bg-zinc-950/85 text-white shadow-2xl ring-1 ring-inset ring-white/10'
-    : 'border-black/20 bg-white/95 text-zinc-950 shadow-2xl ring-1 ring-inset ring-black/5';
+    ? 'border-white/25 bg-zinc-900/95 text-white shadow-[0_24px_60px_rgba(0,0,0,0.75)] ring-1 ring-inset ring-white/15'
+    : 'border-black/20 bg-white/95 text-zinc-950 shadow-[0_24px_60px_rgba(0,0,0,0.2)] ring-1 ring-inset ring-white/80';
+
+  const menuNode =
+    open && typeof document !== 'undefined'
+      ? createPortal(
+          <div
+            ref={menuPortalRef}
+            style={{
+              position: 'fixed',
+              top: `${coords.top}px`,
+              left: `${coords.left}px`,
+              width: `${coords.width}px`,
+              zIndex: 9999,
+            }}
+            className={`tpd-slide-down rounded-2xl border ${menuStyle} p-1.5 backdrop-blur-2xl saturate-150`}
+          >
+            <div className="max-h-60 overflow-y-auto overflow-x-hidden space-y-0.5">
+              {options.map((opt) => {
+                const isSelected = opt.value === value;
+                return (
+                  <button
+                    key={opt.value}
+                    type="button"
+                    onClick={() => {
+                      onChange(opt.value);
+                      setOpen(false);
+                    }}
+                    className={`flex w-full items-center justify-between gap-2 rounded-xl px-3 py-2 text-left text-base sm:text-sm font-medium transition-colors duration-100 ${
+                      isSelected
+                        ? darkMode
+                          ? 'bg-white text-black font-semibold'
+                          : 'bg-zinc-900 text-white font-semibold'
+                        : darkMode
+                          ? 'text-zinc-200 hover:bg-white/10 hover:text-white'
+                          : 'text-zinc-800 hover:bg-black/5 hover:text-black'
+                    }`}
+                  >
+                    <span className="truncate">{opt.label}</span>
+                    {isSelected && <Check size={14} className="shrink-0" />}
+                  </button>
+                );
+              })}
+            </div>
+          </div>,
+          document.body
+        )
+      : null;
 
   return (
     <div ref={containerRef} className={`relative ${fullWidth ? 'w-full' : 'inline-block'}`}>
       <button
+        ref={buttonRef}
         type="button"
         onClick={toggleMenu}
         aria-expanded={open}
-        className={`tpd-click-press flex ${fullWidth ? 'w-full justify-between' : minWidthClass + ' justify-between'} items-center gap-2.5 rounded-2xl border ${triggerStyle} px-3.5 py-2 text-base sm:text-sm font-medium transition-all duration-300 ease-out motion-reduce:transition-none`}
+        className={`tpd-click-press flex ${fullWidth ? 'w-full justify-between' : minWidthClass + ' justify-between'} items-center gap-2 rounded-2xl border ${triggerStyle} px-3.5 py-2 text-base sm:text-sm font-medium transition-all duration-150 ease-out motion-reduce:transition-none`}
       >
         <span className="truncate">{selectedOption?.label ?? value}</span>
         <ChevronDown
           size={15}
-          className={`shrink-0 transition-transform duration-300 ease-out motion-reduce:transition-none ${
-            open && !closing ? 'rotate-180' : ''
+          className={`shrink-0 transition-transform duration-150 ease-out motion-reduce:transition-none ${
+            open ? 'rotate-180' : ''
           }`}
         />
       </button>
-
-      {open && (
-        <div
-          className={`${closing ? 'tpd-cascade-panel-exit' : 'tpd-cascade-panel-enter'} absolute left-0 top-full mt-2 z-50 ${
-            fullWidth ? 'w-full' : 'min-w-[205px]'
-          } rounded-3xl border ${menuStyle} p-2 backdrop-blur-2xl saturate-150 transition-all duration-300 ease-out motion-reduce:transition-none`}
-        >
-          <div className="max-h-64 overflow-y-auto overflow-x-visible space-y-1 p-0.5">
-            {options.map((opt, idx) => {
-              const isSelected = opt.value === value;
-              const staggerMs = Math.min(idx * 42, 320);
-
-              return (
-                <button
-                  key={opt.value}
-                  type="button"
-                  onClick={() => {
-                    onChange(opt.value);
-                    closeMenu();
-                  }}
-                  style={{
-                    animationDelay: closing
-                      ? `${Math.max(0, (options.length - 1 - idx) * 25)}ms`
-                      : `${staggerMs}ms`,
-                  }}
-                  className={`${
-                    closing ? 'tpd-cascade-item-exit' : 'tpd-cascade-item-enter'
-                  } tpd-cascade-option flex w-full items-center justify-between gap-2 rounded-2xl border px-3.5 py-2 text-left text-sm font-medium ${
-                    isSelected
-                      ? darkMode
-                        ? 'border-white/40 bg-white text-black font-semibold shadow-md'
-                        : 'border-black/40 bg-zinc-900 text-white font-semibold shadow-md'
-                      : darkMode
-                        ? 'border-transparent text-zinc-200 hover:border-white/20 hover:bg-white/10 hover:text-white'
-                        : 'border-transparent text-zinc-800 hover:border-black/15 hover:bg-black/5 hover:text-black'
-                  }`}
-                >
-                  <span className="truncate">{opt.label}</span>
-                  {isSelected && <Check size={14} className="shrink-0" />}
-                </button>
-              );
-            })}
-          </div>
-        </div>
-      )}
+      {menuNode}
     </div>
   );
 }
@@ -1113,9 +936,17 @@ export default function InventoryDashboard() {
   const [authMode, setAuthMode] = useState<'login' | 'signup'>('login');
   const [authEmail, setAuthEmail] = useState('');
   const [authPassword, setAuthPassword] = useState('');
+  const [authConfirmPassword, setAuthConfirmPassword] = useState('');
+  const [showAuthPassword, setShowAuthPassword] = useState(false);
+  const [showAuthConfirmPassword, setShowAuthConfirmPassword] = useState(false);
   const [authSubmitting, setAuthSubmitting] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
   const [authMessage, setAuthMessage] = useState<string | null>(null);
+
+  const [confirmDeleteItemId, setConfirmDeleteItemId] = useState<string | null>(null);
+  const [confirmDeleteCategoryId, setConfirmDeleteCategoryId] = useState<string | null>(null);
+  const [confirmDeleteDocId, setConfirmDeleteDocId] = useState<string | null>(null);
+  const [confirmDeleteAuditId, setConfirmDeleteAuditId] = useState<string | null>(null);
 
   const [items, setItems] = useState<InventoryItem[]>([]);
   const [categories, setCategories] = useState<Category[]>([]);
@@ -1123,7 +954,6 @@ export default function InventoryDashboard() {
 
   const [documents, setDocuments] = useState<StockDocument[]>([]);
   const [docModalOpen, setDocModalOpen] = useState(false);
-  const [docModalClosing, setDocModalClosing] = useState(false);
   const [editingDocId, setEditingDocId] = useState<string | null>(null);
   const [docKind, setDocKind] = useState<'INCOMING' | 'OUTGOING'>('INCOMING');
   const [docNo, setDocNo] = useState('No.1');
@@ -1138,14 +968,18 @@ export default function InventoryDashboard() {
   const [addGoodPickerOpen, setAddGoodPickerOpen] = useState(false);
   const [addGoodCatalogQuery, setAddGoodCatalogQuery] = useState('');
   const [inlineNewGoodOpen, setInlineNewGoodOpen] = useState(false);
+  const [inlineNewGoodCustomColorOpen, setInlineNewGoodCustomColorOpen] = useState(false);
   const [inlineNewGood, setInlineNewGood] = useState({
     name: '',
     sku: '',
     category: 'Shirts',
     size: 'M',
-    qty: '1',
+    stock: '0',
+    min: '5',
     colors: [] as string[],
   });
+  const inlineNewGoodRef = useRef<HTMLDivElement | null>(null);
+  const inventorySectionRef = useRef<HTMLElement | null>(null);
   const [batchScanActive, setBatchScanActive] = useState(false);
   const [docMenuOpenId, setDocMenuOpenId] = useState<string | null>(null);
 
@@ -1162,7 +996,6 @@ export default function InventoryDashboard() {
   const [topLowStockBanner, setTopLowStockBanner] = useState<(AppNotification & { closing?: boolean }) | null>(null);
   const topBannerTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [isNotifOpen, setIsNotifOpen] = useState(false);
-  const [isNotifClosing, setIsNotifClosing] = useState(false);
   const seenAuditIdsRef = useRef<Set<string>>(new Set());
   const seenLowStockKeysRef = useRef<Set<string>>(new Set());
   const initialAuditLoadedRef = useRef(false);
@@ -1211,7 +1044,6 @@ export default function InventoryDashboard() {
   }, [batchScanActive]);
 
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
-  const [isSettingsClosing, setIsSettingsClosing] = useState(false);
   const [showLowStockPopUp, setShowLowStockPopUp] = useState(true);
   const [confirmDeleteAccount, setConfirmDeleteAccount] = useState(false);
   const [isDeletingAccount, setIsDeletingAccount] = useState(false);
@@ -1230,7 +1062,6 @@ export default function InventoryDashboard() {
   const [collapsedGroups, setCollapsedGroups] = useState<Record<string, boolean>>({});
 
   const [isModalOpen, setIsModalOpen] = useState(false);
-  const [isModalClosing, setIsModalClosing] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [form, setForm] = useState({ name: '', sku: '', category: 'Shirts', size: 'M', stock: '0', min: '5', colors: [] as string[] });
   const [newCategory, setNewCategory] = useState('');
@@ -1243,7 +1074,6 @@ export default function InventoryDashboard() {
   const [isActionsCramped, setIsActionsCramped] = useState(false);
 
   const [isScannerOpen, setIsScannerOpen] = useState(false);
-  const [isScannerClosing, setIsScannerClosing] = useState(false);
   const [scanMode, setScanMode] = useState<ScanActionMode>('search');
   const [scanQuantity, setScanQuantity] = useState<number>(1);
   const [scannerError, setScannerError] = useState<string | null>(null);
@@ -1256,7 +1086,6 @@ export default function InventoryDashboard() {
   const scanQuantityRef = useRef<number>(1);
 
   const [isPickerOpen, setIsPickerOpen] = useState(false);
-  const [isPickerClosing, setIsPickerClosing] = useState(false);
   const [hue, setHue] = useState(217);
   const [sat, setSat] = useState(0.8);
   const [val, setVal] = useState(0.96);
@@ -1264,6 +1093,20 @@ export default function InventoryDashboard() {
   const [previewSwatchName, setPreviewSwatchName] = useState<string | null>(null);
 
   const [darkMode, setDarkMode] = useState(true);
+
+  useEffect(() => {
+    if (typeof document === 'undefined') return;
+    let metaViewport = document.querySelector('meta[name="viewport"]') as HTMLMetaElement | null;
+    if (!metaViewport) {
+      metaViewport = document.createElement('meta');
+      metaViewport.name = 'viewport';
+      document.head.appendChild(metaViewport);
+    }
+    metaViewport.setAttribute(
+      'content',
+      'width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no'
+    );
+  }, []);
 
   useEffect(() => {
     const el = headerActionsRef.current;
@@ -1286,6 +1129,11 @@ export default function InventoryDashboard() {
     window.addEventListener('resize', checkCramped);
     return () => window.removeEventListener('resize', checkCramped);
   }, [user]);
+
+  useEffect(() => {
+    if (!inlineNewGoodOpen) return;
+    inlineNewGoodRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  }, [inlineNewGoodOpen]);
 
   const fetchStockDocuments = async () => {
     const { data, error } = await supabase
@@ -1326,115 +1174,71 @@ export default function InventoryDashboard() {
     };
   }, [user]);
 
-  const closePickerAnimated = (afterClose?: () => void) => {
-    if (!isPickerOpen || isPickerClosing) {
-      afterClose?.();
-      return;
-    }
-    setIsPickerClosing(true);
-    setTimeout(() => {
-      setIsPickerOpen(false);
-      setIsPickerClosing(false);
-      afterClose?.();
-    }, 200);
-  };
-
-  const togglePickerAnimated = () => {
+  const togglePicker = () => {
     if (isPickerOpen) {
-      closePickerAnimated();
+      setIsPickerOpen(false);
     } else {
-      setIsPickerClosing(false);
       setIsPickerOpen(true);
-      setTimeout(() => {
-        customColorPanelRef.current?.scrollIntoView({
-          behavior: 'smooth',
-          block: 'nearest',
-        });
-      }, 60);
+      requestAnimationFrame(() => {
+        customColorPanelRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      });
     }
   };
 
-  const openNotifAnimated = () => {
-    setIsNotifClosing(false);
+  const openNotifPanel = () => {
+    setNotifications((prev) => prev.map((entry) => ({ ...entry, read: true })));
     setIsNotifOpen(true);
   };
 
-  const closeNotifAnimated = () => {
-    if (!isNotifOpen || isNotifClosing) return;
-    setIsNotifClosing(true);
-    setTimeout(() => {
-      setIsNotifOpen(false);
-      setIsNotifClosing(false);
-    }, 200);
+  const closeNotifPanel = () => {
+    setIsNotifOpen(false);
   };
 
-  const toggleNotifAnimated = () => {
+  const toggleNotifPanel = () => {
     if (isNotifOpen) {
-      closeNotifAnimated();
+      closeNotifPanel();
     } else {
-      openNotifAnimated();
+      openNotifPanel();
     }
   };
 
-  const openSettingsAnimated = () => {
+  const openSettingsModal = () => {
     setConfirmDeleteAccount(false);
-    setIsSettingsClosing(false);
     setIsSettingsOpen(true);
   };
 
-  const closeSettingsAnimated = () => {
-    if (!isSettingsOpen || isSettingsClosing) return;
-    setIsSettingsClosing(true);
-    setTimeout(() => {
-      setIsSettingsOpen(false);
-      setIsSettingsClosing(false);
-      setConfirmDeleteAccount(false);
-    }, 200);
+  const closeSettingsModal = () => {
+    setIsSettingsOpen(false);
+    setConfirmDeleteAccount(false);
   };
 
-  const openScannerAnimated = (forBatchDoc = false) => {
+  const openScannerModal = (forBatchDoc = false) => {
     setScanSuccessBanner(null);
     setScannerError(null);
     setScanFeedback(null);
     setBatchScanActive(forBatchDoc);
-    setIsScannerClosing(false);
     setIsScannerOpen(true);
   };
 
-  const closeScannerAnimated = () => {
-    if (!isScannerOpen || isScannerClosing) return;
-    setIsScannerClosing(true);
-    setTimeout(() => {
-      setIsScannerOpen(false);
-      setIsScannerClosing(false);
-      setBatchScanActive(false);
-      setScanSuccessBanner(null);
-    }, 200);
+  const closeScannerModal = () => {
+    setIsScannerOpen(false);
+    setBatchScanActive(false);
+    setScanSuccessBanner(null);
   };
 
-  const closeModalAnimated = () => {
-    if (!isModalOpen || isModalClosing) return;
-    setIsModalClosing(true);
-    setTimeout(() => {
-      setIsPickerOpen(false);
-      setIsPickerClosing(false);
-      setIsModalOpen(false);
-      setIsModalClosing(false);
-      setSaveSuccess(false);
-      setIsSavingItem(false);
-    }, 200);
+  const closeItemModal = () => {
+    setIsPickerOpen(false);
+    setIsModalOpen(false);
+    setSaveSuccess(false);
+    setIsSavingItem(false);
   };
 
-  const closeDocModalAnimated = () => {
-    if (!docModalOpen || docModalClosing) return;
-    setDocModalClosing(true);
-    setTimeout(() => {
-      setDocModalOpen(false);
-      setDocModalClosing(false);
-      setAddGoodPickerOpen(false);
-      setInlineNewGoodOpen(false);
-      setBatchScanActive(false);
-    }, 200);
+  const closeDocModal = () => {
+    setDocModalOpen(false);
+    setAddGoodPickerOpen(false);
+    setInlineNewGoodOpen(false);
+    setInlineNewGoodCustomColorOpen(false);
+    setBatchScanActive(false);
   };
 
   const getNextDocNumber = (kind: 'INCOMING' | 'OUTGOING') => {
@@ -1457,15 +1261,16 @@ export default function InventoryDashboard() {
     setAddGoodPickerOpen(false);
     setAddGoodCatalogQuery('');
     setInlineNewGoodOpen(false);
+    setInlineNewGoodCustomColorOpen(false);
     setInlineNewGood({
       name: '',
       sku: '',
       category: categories[0]?.name || 'Shirts',
       size: 'M',
-      qty: '1',
+      stock: '0',
+      min: '5',
       colors: [],
     });
-    setDocModalClosing(false);
     setDocModalOpen(true);
   };
 
@@ -1489,8 +1294,8 @@ export default function InventoryDashboard() {
     setGoodsInfoExpanded(true);
     setAddGoodPickerOpen(false);
     setInlineNewGoodOpen(false);
+    setInlineNewGoodCustomColorOpen(false);
     setDocMenuOpenId(null);
-    setDocModalClosing(false);
     setDocModalOpen(true);
   };
 
@@ -1522,6 +1327,7 @@ export default function InventoryDashboard() {
           sku: catalogItem.sku,
           category: catalogItem.category,
           size: catalogItem.size,
+          min: catalogItem.min,
           colors: catalogItem.colors || [],
           qty: safeQty,
         },
@@ -1532,7 +1338,9 @@ export default function InventoryDashboard() {
   const addInlineNewItemToDocument = () => {
     const cleanName = inlineNewGood.name.trim();
     if (!cleanName) return;
-    const safeQty = Math.max(1, parseInt(inlineNewGood.qty, 10) || 1);
+    const stockVal = Math.max(0, parseInt(inlineNewGood.stock, 10) || 0);
+    const minVal = Math.max(0, parseInt(inlineNewGood.min, 10) || 0);
+    const safeQty = stockVal > 0 ? stockVal : 1;
     const cleanCat = inlineNewGood.category || categories[0]?.name || 'General';
     const cleanSku = inlineNewGood.sku.trim() || buildSkuForCategory(cleanCat);
 
@@ -1544,6 +1352,7 @@ export default function InventoryDashboard() {
         sku: cleanSku,
         category: cleanCat,
         size: inlineNewGood.size.trim() || 'M',
+        min: minVal,
         colors: inlineNewGood.colors,
         qty: safeQty,
         isNewCatalogItem: true,
@@ -1555,10 +1364,12 @@ export default function InventoryDashboard() {
       sku: '',
       category: cleanCat,
       size: 'M',
-      qty: '1',
+      stock: '0',
+      min: '5',
       colors: [],
     });
     setInlineNewGoodOpen(false);
+    setInlineNewGoodCustomColorOpen(false);
     setAddGoodPickerOpen(false);
   };
 
@@ -1584,6 +1395,9 @@ export default function InventoryDashboard() {
     const cleanDateTime = docDateTime.trim() || formatCurrentDocDateTime();
     const cleanDescription = docDescription.trim();
     const prevDocs = documents;
+
+    setActiveTab(docKind === 'INCOMING' ? 'incoming' : 'outgoing');
+    closeDocModal();
 
     if (editingDocId) {
       const updatedDoc: StockDocument = {
@@ -1616,14 +1430,7 @@ export default function InventoryDashboard() {
       if (error) {
         setDocuments(prevDocs);
         pushNotification('Save Failed', error.message, 'info');
-        return;
       }
-
-      pushNotification(
-        docKind === 'INCOMING' ? 'Procurement Updated' : 'Outgoing Updated',
-        `${cleanDocNo} (${docGoods.length} line(s)) saved for all staff.`,
-        'info'
-      );
     } else {
       const nowIso = new Date().toISOString();
       const newDoc: StockDocument = {
@@ -1658,20 +1465,8 @@ export default function InventoryDashboard() {
       if (error) {
         setDocuments(prevDocs);
         pushNotification('Save Failed', error.message, 'info');
-        return;
       }
-
-      pushNotification(
-        docKind === 'INCOMING' ? 'Procurement Saved' : 'Outgoing Saved',
-        docKind === 'INCOMING'
-          ? `${newDoc.docNo} saved; stock adds on ✓.`
-          : `${newDoc.docNo} saved; stock deducts on ✓.`,
-        'info'
-      );
     }
-
-    setActiveTab(docKind === 'INCOMING' ? 'incoming' : 'outgoing');
-    closeDocModalAnimated();
   };
 
   const commitDocumentToInventory = async (docId: string) => {
@@ -1682,7 +1477,6 @@ export default function InventoryDashboard() {
 
     const isIncoming = targetDoc.kind === 'INCOMING';
     const currentItems = [...(itemsRef.current.length > 0 ? itemsRef.current : items)];
-    const changedSummaries: string[] = [];
 
     for (const line of targetDoc.goods) {
       const matchedIdx = currentItems.findIndex(
@@ -1740,17 +1534,14 @@ export default function InventoryDashboard() {
           }
         );
 
-        changedSummaries.push(
-          `${inv.name} (${isIncoming ? `+${line.qty}` : `-${line.qty}`}: ${prevStock}→${nextStock})`
-        );
-
         if (nextStatus === 'OUT OF STOCK' || nextStatus === 'LOW') {
           seenLowStockKeysRef.current.add(`${inv.id}::${nextStock}::${inv.min}`);
           void notifyAllUsersLowStock(inv.name, inv.sku, nextStock, inv.min);
         }
       } else {
+        const minVal = Math.max(0, Number(line.min ?? 5));
         const createdStock = isIncoming ? line.qty : 0;
-        const createdStatus = computeItemStatus(createdStock, 5);
+        const createdStatus = computeItemStatus(createdStock, minVal);
         const dbStatus = createdStatus === 'OUT OF STOCK' ? 'LOW' : createdStatus;
         const tempId = `temp-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
         const createdItem: InventoryItem = {
@@ -1760,7 +1551,7 @@ export default function InventoryDashboard() {
           category: line.category || categories[0]?.name || 'General',
           size: line.size || 'M',
           stock: createdStock,
-          min: 5,
+          min: minVal,
           status: createdStatus,
           colors: line.colors || [],
         };
@@ -1810,7 +1601,6 @@ export default function InventoryDashboard() {
             partyName: targetDoc.partyName,
           }
         );
-        changedSummaries.push(`${createdItem.name} (+${line.qty}: 0→${createdStock})`);
       }
     }
 
@@ -1824,27 +1614,18 @@ export default function InventoryDashboard() {
       )
     );
 
-    const { error: docUpdateError } = await supabase
-      .from('stock_documents')
-      .update({ status: 'COMPLETED', completed_at: completedTime })
-      .eq('id', docId);
-
-    if (docUpdateError) {
-      pushNotification('Status Sync Warning', docUpdateError.message, 'info');
-    }
-
     if (scanSoundEnabledRef.current) {
       playScanFeedbackChime(true, false);
     }
 
-    pushNotification(
-      isIncoming ? 'Procurement Added' : 'Outgoing Deducted',
-      `${targetDoc.docNo}: ${changedSummaries.join(', ') || 'Stock updated'}`,
-      'stock_update'
-    );
+    await supabase
+      .from('stock_documents')
+      .update({ status: 'COMPLETED', completed_at: completedTime })
+      .eq('id', docId);
   };
 
   const deleteStockDocument = async (docId: string) => {
+    setConfirmDeleteDocId(null);
     setDocMenuOpenId(null);
     const prevDocs = documents;
     setDocuments((prev) => prev.filter((d) => d.id !== docId));
@@ -1885,7 +1666,7 @@ export default function InventoryDashboard() {
         delete next[itemId];
         return next;
       });
-    }, 600);
+    }, 350);
   };
 
   const dismissTopLowStockBanner = () => {
@@ -1896,7 +1677,7 @@ export default function InventoryDashboard() {
     setTopLowStockBanner((prev) => (prev ? { ...prev, closing: true } : null));
     setTimeout(() => {
       setTopLowStockBanner(null);
-    }, 220);
+    }, 180);
   };
 
   const triggerTopLowStockPop = (entry: AppNotification) => {
@@ -1907,7 +1688,7 @@ export default function InventoryDashboard() {
     setTopLowStockBanner({ ...entry, closing: false });
     topBannerTimeoutRef.current = setTimeout(() => {
       dismissTopLowStockBanner();
-    }, 5500);
+    }, 4500);
   };
 
   const pushNotification = (
@@ -1973,12 +1754,12 @@ export default function InventoryDashboard() {
           target.isContentEditable);
 
       if (e.key === 'Escape') {
-        if (isPickerOpen) closePickerAnimated();
-        else if (isModalOpen) closeModalAnimated();
-        else if (docModalOpen) closeDocModalAnimated();
-        else if (isScannerOpen) closeScannerAnimated();
-        else if (isSettingsOpen) closeSettingsAnimated();
-        else if (isNotifOpen) closeNotifAnimated();
+        if (isPickerOpen) setIsPickerOpen(false);
+        else if (isModalOpen) closeItemModal();
+        else if (docModalOpen) closeDocModal();
+        else if (isScannerOpen) closeScannerModal();
+        else if (isSettingsOpen) closeSettingsModal();
+        else if (isNotifOpen) closeNotifPanel();
         else if (isAuditMaximized) setIsAuditMaximized(false);
       } else if (e.key === '/' && !isTypingField && user) {
         e.preventDefault();
@@ -2097,8 +1878,8 @@ export default function InventoryDashboard() {
       : 'bg-amber-100 text-amber-950 border-amber-300',
     overlay: darkMode ? 'bg-black/45 backdrop-blur-md' : 'bg-zinc-900/25 backdrop-blur-md',
     modalBg: darkMode
-      ? 'bg-zinc-950/90 border-white/20 backdrop-blur-2xl saturate-150 ring-1 ring-inset ring-white/10'
-      : 'bg-white/95 border-black/20 backdrop-blur-2xl saturate-150 ring-1 ring-inset ring-black/5',
+      ? 'bg-zinc-900/55 border-white/20 backdrop-blur-2xl saturate-150 ring-1 ring-inset ring-white/15'
+      : 'bg-white/75 border-black/20 backdrop-blur-2xl saturate-150 ring-1 ring-inset ring-white/80',
     badgeBg: darkMode
       ? 'border-white/15 bg-white/[0.08] text-zinc-200 backdrop-blur-md'
       : 'border-black/15 bg-white/80 text-zinc-800',
@@ -2120,19 +1901,32 @@ export default function InventoryDashboard() {
     e.preventDefault();
     setAuthError(null);
     setAuthMessage(null);
+
+    const normalizedEmail = authEmail.trim().toLowerCase();
+    if (!isGmailAddress(normalizedEmail)) {
+      setAuthError('Email address must end with @gmail.com.');
+      return;
+    }
+
+    if (authMode === 'signup' && authPassword !== authConfirmPassword) {
+      setAuthError('Passwords do not match.');
+      return;
+    }
+
     setAuthSubmitting(true);
 
     try {
       if (authMode === 'signup') {
-        const { data, error } = await supabase.auth.signUp({ email: authEmail, password: authPassword });
+        const { data, error } = await supabase.auth.signUp({ email: normalizedEmail, password: authPassword });
         if (error) throw error;
         if (data.session) setUser(data.session.user);
         else {
-          setAuthMessage('Account created! Check your email to confirm your account.');
+          setAuthMessage('Account created! Check your Gmail to confirm your account.');
+          setAuthConfirmPassword('');
           setAuthMode('login');
         }
       } else {
-        const { data, error } = await supabase.auth.signInWithPassword({ email: authEmail, password: authPassword });
+        const { data, error } = await supabase.auth.signInWithPassword({ email: normalizedEmail, password: authPassword });
         if (error) throw error;
         setUser(data.user);
       }
@@ -2190,6 +1984,15 @@ export default function InventoryDashboard() {
 
   const addColorToForm = (colorName: string) => {
     setForm((current) => ({
+      ...current,
+      colors: current.colors.includes(colorName)
+        ? current.colors
+        : [...current.colors, colorName],
+    }));
+  };
+
+  const addColorToInlineNewGood = (colorName: string) => {
+    setInlineNewGood((current) => ({
       ...current,
       colors: current.colors.includes(colorName)
         ? current.colors
@@ -2397,25 +2200,15 @@ export default function InventoryDashboard() {
     );
     if (chosenItems.length === 0) return;
 
-    setExpandedBarcodes((prev) => {
-      const next = { ...prev };
-      chosenItems.forEach((entry) => {
-        next[entry.id] = true;
-      });
-      return next;
-    });
-
-    setTimeout(() => {
-      const allCardsHtml = chosenItems
-        .map((entry) => buildSingleBarcodeCardHtml(entry, getItemPrintCopies(entry.id), labelFormat))
-        .filter(Boolean)
-        .join('');
-      if (!allCardsHtml) return;
-      openPrintWindowWithCards(
-        `THE PRINTING DEPOT - Batch Barcodes (${chosenItems.length} items)`,
-        allCardsHtml
-      );
-    }, 80);
+    const allCardsHtml = chosenItems
+      .map((entry) => buildSingleBarcodeCardHtml(entry, getItemPrintCopies(entry.id), labelFormat))
+      .filter(Boolean)
+      .join('');
+    if (!allCardsHtml) return;
+    openPrintWindowWithCards(
+      `THE PRINTING DEPOT - Batch Barcodes (${chosenItems.length} items)`,
+      allCardsHtml
+    );
   };
 
   const fetchData = async () => {
@@ -2492,7 +2285,7 @@ export default function InventoryDashboard() {
       if (fetchDebounceRef) clearTimeout(fetchDebounceRef);
       fetchDebounceRef = setTimeout(() => {
         void fetchData();
-      }, 180);
+      }, 80);
     };
 
     void fetchData();
@@ -2602,6 +2395,7 @@ export default function InventoryDashboard() {
   };
 
   const deleteAuditLog = async (auditId: string) => {
+    setConfirmDeleteAuditId(null);
     const prevLog = auditLog;
     setAuditLog((prev) => {
       const next = prev.filter((entry) => entry.id !== auditId);
@@ -2780,7 +2574,6 @@ export default function InventoryDashboard() {
 
     const keepOpen = continuousScanRef.current || batchScanActiveRef.current;
     const playChime = scanSoundEnabledRef.current;
-    const unlockDelay = keepOpen ? 500 : 850;
     let shouldUnlockInFinally = keepOpen;
 
     try {
@@ -2832,9 +2625,7 @@ export default function InventoryDashboard() {
         if (!keepOpen) {
           shouldUnlockInFinally = false;
           if (stopCameraFn) await stopCameraFn();
-          if (allowCloseModal) {
-            setTimeout(() => closeScannerAnimated(), unlockDelay);
-          }
+          if (allowCloseModal) closeScannerModal();
         }
         return;
       }
@@ -2851,9 +2642,7 @@ export default function InventoryDashboard() {
         if (!keepOpen) {
           shouldUnlockInFinally = false;
           if (stopCameraFn) await stopCameraFn();
-          if (allowCloseModal) {
-            setTimeout(() => closeScannerAnimated(), 1100);
-          }
+          if (allowCloseModal) closeScannerModal();
         }
         return;
       }
@@ -2877,15 +2666,13 @@ export default function InventoryDashboard() {
       if (!keepOpen) {
         shouldUnlockInFinally = false;
         if (stopCameraFn) await stopCameraFn();
-        if (allowCloseModal) {
-          setTimeout(() => closeScannerAnimated(), unlockDelay);
-        }
+        if (allowCloseModal) closeScannerModal();
       }
     } finally {
       if (shouldUnlockInFinally) {
         setTimeout(() => {
           scanLockedRef.current = false;
-        }, unlockDelay);
+        }, 350);
       }
     }
   };
@@ -2913,7 +2700,7 @@ export default function InventoryDashboard() {
         try {
           await instance.stop();
         } catch {
-          // Ignore stop errors if already stopped
+          // Ignore stop errors
         }
         try {
           instance.clear();
@@ -2925,7 +2712,7 @@ export default function InventoryDashboard() {
     };
 
     const startScanner = async () => {
-      if (!isScannerOpen || isScannerClosing) {
+      if (!isScannerOpen) {
         await stopScanner();
         return;
       }
@@ -2936,15 +2723,11 @@ export default function InventoryDashboard() {
           window.location.hostname === '127.0.0.1' ||
           window.location.hostname === '[::1]';
         if (!window.isSecureContext && !isLocalhost) {
-          setScannerError(
-            'Camera requires HTTPS or localhost.'
-          );
+          setScannerError('Camera requires HTTPS or localhost.');
           return;
         }
         if (!navigator.mediaDevices || typeof navigator.mediaDevices.getUserMedia !== 'function') {
-          setScannerError(
-            'Camera API is unavailable in this browser.'
-          );
+          setScannerError('Camera API is unavailable in this browser.');
           return;
         }
       }
@@ -2980,7 +2763,7 @@ export default function InventoryDashboard() {
         scannerInstanceRef.current = scanner;
 
         const scanConfig = {
-          fps: 20,
+          fps: 24,
           aspectRatio: 1.333,
           qrbox: (viewfinderWidth: number, viewfinderHeight: number) => {
             const width = Math.min(280, Math.max(170, Math.floor(viewfinderWidth * 0.82)));
@@ -3083,7 +2866,7 @@ export default function InventoryDashboard() {
       active = false;
       void stopScanner();
     };
-  }, [isScannerOpen, isScannerClosing, cameraRestartNonce]);
+  }, [isScannerOpen, cameraRestartNonce]);
 
   const filteredItems = useMemo(() => {
     return items.filter((item) => {
@@ -3214,13 +2997,21 @@ export default function InventoryDashboard() {
       await navigator.clipboard.writeText(text);
       setCopiedRestockList(true);
       pushNotification('Buy List Copied', `${lowStockItems.length} item(s) copied.`, 'info');
-      setTimeout(() => setCopiedRestockList(false), 1800);
+      setTimeout(() => setCopiedRestockList(false), 1200);
     } catch {
       pushNotification('Copy Unavailable', 'Unable to access clipboard.', 'info');
     }
   };
 
+  const scrollInventoryToFit = () => {
+    requestAnimationFrame(() => {
+      inventorySectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    });
+  };
+
   const openCreateModal = (defaultCategory?: string) => {
+    setActiveTab('inventory');
+    scrollInventoryToFit();
     setEditingId(null);
     setForm({
       name: '',
@@ -3235,28 +3026,6 @@ export default function InventoryDashboard() {
     setSaveSuccess(false);
     setIsSavingItem(false);
     setIsPickerOpen(false);
-    setIsPickerClosing(false);
-    setIsModalClosing(false);
-    setIsModalOpen(true);
-  };
-
-  const openDuplicateModal = (item: InventoryItem) => {
-    setEditingId(null);
-    setForm({
-      name: item.name,
-      sku: buildSkuForCategory(item.category),
-      category: item.category || categories[0]?.name || 'Shirts',
-      size: item.size || 'M',
-      stock: '0',
-      min: String(item.min ?? 5),
-      colors: item.colors ? [...item.colors] : [],
-    });
-    setPreviewSwatchName(null);
-    setSaveSuccess(false);
-    setIsSavingItem(false);
-    setIsPickerOpen(false);
-    setIsPickerClosing(false);
-    setIsModalClosing(false);
     setIsModalOpen(true);
   };
 
@@ -3275,8 +3044,6 @@ export default function InventoryDashboard() {
     setSaveSuccess(false);
     setIsSavingItem(false);
     setIsPickerOpen(false);
-    setIsPickerClosing(false);
-    setIsModalClosing(false);
     setIsModalOpen(true);
   };
 
@@ -3324,12 +3091,7 @@ export default function InventoryDashboard() {
       itemsRef.current = updatedList;
       setItems(updatedList);
       triggerStockPulse(editingId);
-
-      setIsSavingItem(false);
-      setSaveSuccess(true);
-      setTimeout(() => {
-        closeModalAnimated();
-      }, 280);
+      closeItemModal();
 
       void supabase.from('items').update(dbPayload).eq('id', editingId).then(({ error }) => {
         if (error) {
@@ -3390,12 +3152,7 @@ export default function InventoryDashboard() {
       const updatedList = [optimisticItem, ...previousItems];
       itemsRef.current = updatedList;
       setItems(updatedList);
-
-      setIsSavingItem(false);
-      setSaveSuccess(true);
-      setTimeout(() => {
-        closeModalAnimated();
-      }, 280);
+      closeItemModal();
 
       void supabase
         .from('items')
@@ -3451,6 +3208,7 @@ export default function InventoryDashboard() {
   };
 
   const deleteItem = (itemId: string) => {
+    setConfirmDeleteItemId((prev) => (prev === itemId ? null : null));
     const previousItems = itemsRef.current;
     const item = previousItems.find((entry) => entry.id === itemId);
     const filtered = previousItems.filter((entry) => entry.id !== itemId);
@@ -3493,11 +3251,6 @@ export default function InventoryDashboard() {
     const prevCategories = categories;
     setCategories((prev) => [...prev, { id: tempId, name: cleanName }]);
     setNewCategory('');
-    setIsAddingCategory(false);
-    setCategoryAddSuccess(true);
-    setTimeout(() => {
-      setCategoryAddSuccess(false);
-    }, 500);
 
     void supabase
       .from('categories')
@@ -3520,6 +3273,7 @@ export default function InventoryDashboard() {
   };
 
   const deleteCategory = (categoryId: string, categoryName: string) => {
+    setConfirmDeleteCategoryId(null);
     const hasItems = itemsRef.current.some((item) => item.category === categoryName);
     if (hasItems) {
       pushNotification('Category In Use', `Reassign items in "${categoryName}" first.`, 'info');
@@ -3568,10 +3322,11 @@ export default function InventoryDashboard() {
 
   const handleExportPdfChoice = (choice: 'all' | 'filtered') => {
     if (choice === 'all') {
-      openInventoryPdfReport(
+      downloadInventoryPdf(
         'Complete Inventory Report',
         'All inventory items across all categories and statuses',
-        items
+        items,
+        'all'
       );
     } else {
       const filterDesc = [
@@ -3582,10 +3337,11 @@ export default function InventoryDashboard() {
         .filter(Boolean)
         .join(' • ');
 
-      openInventoryPdfReport(
+      downloadInventoryPdf(
         'Filtered Inventory Report',
         filterDesc || 'Current filtered / displayed inventory items',
-        filteredItems
+        filteredItems,
+        'filtered'
       );
     }
   };
@@ -3594,15 +3350,16 @@ export default function InventoryDashboard() {
     const isIncoming = doc.kind === 'INCOMING';
     const isPending = doc.status === 'PENDING';
     const totalUnits = doc.goods.reduce((sum, line) => sum + line.qty, 0);
+    const isConfirmingDocDelete = confirmDeleteDocId === doc.id;
 
     return (
       <div
         key={doc.id}
-        className={`rounded-2xl border p-4 transition-all duration-200 ${
+        className={`rounded-2xl border p-4 transition-all duration-150 ${
           isPending
             ? isIncoming
-              ? 'border-emerald-500/45 bg-emerald-500/10'
-              : 'border-amber-500/45 bg-amber-500/10'
+              ? 'border-emerald-400/35 bg-emerald-500/12 backdrop-blur-xl'
+              : 'border-white/25 bg-white/[0.09] backdrop-blur-xl'
             : `${t.border} ${t.cardBg3}`
         }`}
       >
@@ -3615,17 +3372,11 @@ export default function InventoryDashboard() {
                   isPending
                     ? isIncoming
                       ? t.incomingBadge
-                      : t.outgoingBadge
+                      : t.badgeBg
                     : t.okBg
                 }`}
               >
-                {isPending
-                  ? isIncoming
-                    ? 'PENDING'
-                    : 'PENDING'
-                  : isIncoming
-                    ? 'ADDED'
-                    : 'DEDUCTED'}
+                {isPending ? 'PENDING' : isIncoming ? 'ADDED' : 'DEDUCTED'}
               </span>
               <span className={`rounded-full border ${t.badgeBg} px-2 py-0.5 text-[10px] font-bold tabular-nums`}>
                 {totalUnits} qty
@@ -3654,7 +3405,7 @@ export default function InventoryDashboard() {
                     : 'Deduct goods from stock'
                 }
                 aria-label="Confirm and apply to stock"
-                className="tpd-click-press inline-flex items-center gap-1 rounded-xl border border-emerald-500 bg-emerald-600 px-3 py-1.5 text-xs font-extrabold text-white shadow-sm hover:bg-emerald-700"
+                className="tpd-click-press inline-flex items-center gap-1 rounded-xl border border-emerald-400/40 bg-emerald-600 px-3 py-1.5 text-xs font-extrabold text-white shadow-sm hover:bg-emerald-700"
               >
                 <Check size={14} strokeWidth={3} />
                 <span>{isIncoming ? 'Arrive & Add' : 'Deduct Stock'}</span>
@@ -3672,7 +3423,7 @@ export default function InventoryDashboard() {
             )}
             <button
               type="button"
-              onClick={() => void deleteStockDocument(doc.id)}
+              onClick={() => setConfirmDeleteDocId((prev) => (prev === doc.id ? null : doc.id))}
               title="Delete document"
               className={`tpd-click-press rounded-xl border ${t.border} p-1.5 ${t.dangerText} hover:bg-red-500/15`}
             >
@@ -3680,6 +3431,30 @@ export default function InventoryDashboard() {
             </button>
           </div>
         </div>
+
+        {isConfirmingDocDelete && (
+          <div
+            className={`tpd-slide-down mt-2.5 flex items-center justify-between gap-2 rounded-xl border ${t.needsRestockBorder} ${t.needsRestockBg} px-3 py-1.5 text-xs`}
+          >
+            <span className="font-semibold">you want to delete ?</span>
+            <div className="flex items-center gap-1.5 shrink-0">
+              <button
+                type="button"
+                onClick={() => void deleteStockDocument(doc.id)}
+                className="tpd-click-press rounded-lg border border-red-700 bg-red-600 px-2.5 py-0.5 text-[11px] font-bold text-white hover:bg-red-700"
+              >
+                Yes
+              </button>
+              <button
+                type="button"
+                onClick={() => setConfirmDeleteDocId(null)}
+                className={`tpd-click-press rounded-lg border ${t.border} ${t.btnSecondary} px-2.5 py-0.5 text-[11px] font-semibold`}
+              >
+                No
+              </button>
+            </div>
+          </div>
+        )}
 
         <div className={`mt-3 space-y-1.5 border-t ${t.border} pt-2.5`}>
           {doc.goods.map((line) => {
@@ -3746,7 +3521,7 @@ export default function InventoryDashboard() {
     return (
       <div
         key={entry.id}
-        className={`rounded-2xl border ${t.border} ${t.cardBgHover} p-3.5 transition-all duration-200 ease-out motion-reduce:transition-none`}
+        className={`rounded-2xl border ${t.border} ${t.cardBgHover} p-3.5 transition-all duration-150 ease-out motion-reduce:transition-none`}
       >
         <div className="flex items-start justify-between gap-3">
           <div className="min-w-0 flex-1">
@@ -3754,7 +3529,7 @@ export default function InventoryDashboard() {
               <p className="font-bold text-sm truncate">{entry.item}</p>
               <span
                 className={`rounded-full border px-2 py-0.5 text-[10px] font-bold shrink-0 ${
-                  isIncoming ? t.incomingBadge : t.outgoingBadge
+                  isIncoming ? t.incomingBadge : t.badgeBg
                 }`}
               >
                 {isIncoming ? 'PROCUREMENT' : 'OUTGOING'}
@@ -3811,6 +3586,7 @@ export default function InventoryDashboard() {
     const isExpanded = Boolean(expandedBarcodes[item.id]);
     const isPulsed = Boolean(pulsedItemIds[item.id]);
     const isBarcodeSelected = selectedBarcodeItemIds.has(item.id);
+    const isConfirmingDelete = confirmDeleteItemId === item.id;
     const customQty = Math.max(1, Number(customCardQty[item.id]) || 5);
     const copiesCount = getItemPrintCopies(item.id);
     const barcodeItemSizeLabel = formatBarcodeItemSizeLabel(item.name, item.size);
@@ -3819,7 +3595,7 @@ export default function InventoryDashboard() {
     return (
       <div
         key={item.id}
-        className={`rounded-2xl border p-3.5 sm:p-4 transition-all duration-200 ease-out motion-reduce:transition-none hover:-translate-y-0.5 hover:shadow-lg ${
+        className={`flex flex-col justify-between rounded-2xl border p-3 transition-all duration-150 ease-out motion-reduce:transition-none hover:-translate-y-0.5 hover:shadow-lg ${
           isBarcodeSelected
             ? 'border-sky-400/70 ring-2 ring-sky-400/20'
             : isPulsed
@@ -3827,38 +3603,41 @@ export default function InventoryDashboard() {
               : t.border
         } ${t.cardBgHover}`}
       >
-        <div className="flex items-start justify-between gap-2">
-          <div className="flex items-start gap-2.5 min-w-0 flex-1">
-            {barcodeSelectMode && (
-              <input
-                type="checkbox"
-                checked={isBarcodeSelected}
-                onChange={() => toggleBarcodeSelection(item.id)}
-                aria-label={`Select barcode for ${item.name}`}
-                className="mt-1 h-4 w-4 rounded border-zinc-600 accent-sky-400 cursor-pointer shrink-0"
-              />
-            )}
-            <div className="min-w-0 flex-1">
-              <p className="font-semibold text-sm sm:text-base truncate">{item.name}</p>
-              <p className={`text-xs ${t.textMuted2} truncate`}>{item.sku} &bull; {item.size}</p>
+        <div>
+          <div className="flex items-start justify-between gap-1.5">
+            <div className="flex items-start gap-2 min-w-0 flex-1">
+              {barcodeSelectMode && (
+                <input
+                  type="checkbox"
+                  checked={isBarcodeSelected}
+                  onChange={() => toggleBarcodeSelection(item.id)}
+                  aria-label={`Select barcode for ${item.name}`}
+                  className="mt-0.5 h-3.5 w-3.5 rounded border-zinc-600 accent-sky-400 cursor-pointer shrink-0"
+                />
+              )}
+              <div className="min-w-0 flex-1">
+                <p className="font-bold text-xs sm:text-sm truncate">{item.name}</p>
+                <p className={`text-[11px] ${t.textMuted2} truncate`}>
+                  {item.sku || 'No SKU'} &bull; {item.size}
+                </p>
+              </div>
             </div>
-          </div>
-          <div className="flex items-center gap-2 shrink-0">
-            <span className={`rounded-full border ${t.badgeBg} px-2 py-0.5 text-[11px]`}>{item.category}</span>
-            <span className={`rounded-full border px-2.5 py-0.5 text-[11px] font-semibold transition-transform duration-200 ease-out motion-reduce:transition-none hover:scale-105 ${getStatusBadgeStyle(item.status)}`}>
+            <span
+              className={`rounded-full border px-2 py-0.5 text-[10px] font-bold shrink-0 ${getStatusBadgeStyle(
+                item.status
+              )}`}
+            >
               {item.status}
             </span>
           </div>
-        </div>
 
-        <div className="mt-3 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-          <div className="flex items-center justify-between sm:justify-start sm:gap-4 text-xs tabular-nums">
+          <div className="mt-2 flex items-center justify-between gap-2 text-xs tabular-nums">
             <span className={t.textMuted}>
               Stock:{' '}
               <strong
-                className={`inline-block transition-transform duration-200 ease-out motion-reduce:transition-none ${
+                className={`inline-block transition-transform duration-150 ease-out motion-reduce:transition-none ${
                   isPulsed
-                    ? `scale-110 ${t.successText}`
+                    ? `scale-105 ${t.successText}`
                     : isOutOfStock
                       ? `${t.dangerText} font-black`
                       : t.text
@@ -3867,135 +3646,157 @@ export default function InventoryDashboard() {
                 {item.stock}
               </strong>
             </span>
-            <span className={t.textMuted}>Min: {item.min}</span>
+            <span className={`text-[11px] ${t.textMuted2}`}>Min: {item.min}</span>
           </div>
 
-          <div className="flex flex-wrap items-center gap-1.5 shrink-0">
-            <button onClick={() => adjustStock(item.id, -5, 'button')} title="Outgoing -5" className={`tpd-click-press rounded-full border ${t.border} ${t.btnSecondary} px-2 py-1 text-[11px] font-semibold tabular-nums`}>-5</button>
-            <button onClick={() => adjustStock(item.id, -1, 'button')} title="Outgoing -1" className={`tpd-click-press rounded-full border ${t.border} ${t.btnSecondary} px-2.5 py-1 text-xs font-semibold`}>-</button>
-            <button onClick={() => adjustStock(item.id, 1, 'button')} title="Procurement +1" className={`tpd-click-press rounded-full border ${t.border} ${t.btnSecondary} px-2.5 py-1 text-xs font-semibold`}>+</button>
-            <button onClick={() => adjustStock(item.id, 5, 'button')} title="Procurement +5" className={`tpd-click-press rounded-full border ${t.border} ${t.btnSecondary} px-2 py-1 text-[11px] font-semibold tabular-nums`}>+5</button>
-            <button onClick={() => adjustStock(item.id, 10, 'button')} title="Procurement +10" className={`tpd-click-press rounded-full border ${t.border} ${t.btnSecondary} px-2 py-1 text-[11px] font-semibold tabular-nums`}>+10</button>
-
-            <div className={`inline-flex items-center rounded-full border ${t.border} ${t.inputBg} pl-1.5 pr-1 py-0.5`}>
-              <input
-                type="number"
-                min={1}
-                value={customQty}
-                onChange={(e) => {
-                  const parsed = parseInt(e.target.value, 10);
-                  setCustomCardQty((prev) => ({
-                    ...prev,
-                    [item.id]: Number.isNaN(parsed) ? 1 : Math.max(1, parsed),
-                  }));
-                }}
-                aria-label={`Custom quantity for ${item.name}`}
-                className={`w-11 bg-transparent text-center text-base sm:text-[11px] font-bold tabular-nums outline-none ${t.text}`}
-              />
-              <button
-                type="button"
-                onClick={() => adjustStock(item.id, customQty, 'button')}
-                title={`Add +${customQty}`}
-                className={`tpd-click-press rounded-full border ${t.btnPrimary} px-2 py-0.5 text-[10px] font-bold tabular-nums`}
-              >
-                +{customQty}
-              </button>
+          {(item.colors || []).length > 0 && (
+            <div className="mt-2 flex flex-wrap gap-1">
+              {(item.colors || []).map((color) => (
+                <span
+                  key={color}
+                  className={`group inline-flex items-center gap-1 rounded-full border ${t.badgeBg} px-2 py-0.5 text-[10px]`}
+                >
+                  <ColorCircle color={color} size="sm" />
+                  <span className="truncate max-w-[68px]">{color}</span>
+                </span>
+              ))}
             </div>
-
-            <button
-              type="button"
-              onClick={() => openDuplicateModal(item)}
-              title="Duplicate item"
-              aria-label="Duplicate item"
-              className={`tpd-click-press rounded-full border ${t.border} ${t.btnSecondary} p-1.5`}
-            >
-              <Copy size={13} />
-            </button>
-            <button onClick={() => openEditModal(item)} title="Edit item" aria-label="Edit item" className={`tpd-click-press rounded-full border ${t.border} ${t.btnSecondary} p-1.5`}><Edit3 size={13} /></button>
-            <button onClick={() => deleteItem(item.id)} title="Delete item" aria-label="Delete item" className={`tpd-click-press rounded-full border ${t.border} ${t.btnSecondary} p-1.5 ${t.dangerText}`}><Trash2 size={13} /></button>
-          </div>
+          )}
         </div>
 
-        {(item.colors || []).length > 0 && (
-          <div className={`mt-3 flex flex-wrap gap-1.5 pt-2 border-t ${t.border}`}>
-            {(item.colors || []).map((color) => (
-              <span key={color} className={`group flex items-center gap-2 rounded-full border ${t.badgeBg} px-2.5 py-0.5 text-[11px] transition-transform duration-150 ease-out motion-reduce:transition-none hover:scale-105`}>
-                <ColorCircle color={color} size="sm" />
-                <span>{color}</span>
-              </span>
-            ))}
-          </div>
-        )}
-
-        {item.sku && (
-          <div className={`mt-3 pt-2 border-t ${t.border}`}>
-            <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className={`mt-2.5 pt-2 border-t ${t.border} space-y-2`}>
+          <div className="flex items-center justify-between gap-1">
+            <div className="flex items-center gap-1">
               <button
                 type="button"
-                onClick={() => toggleBarcodeExpand(item.id)}
-                className={`tpd-click-press inline-flex items-center gap-1.5 rounded-xl border ${t.border} ${t.cardBg3} px-2.5 py-1 text-[11px] font-medium ${t.textMuted} transition-all duration-150 ease-out motion-reduce:transition-none hover:scale-105`}
+                onClick={() => void adjustStock(item.id, -1, 'button')}
+                title="Deduct -1"
+                className={`tpd-click-press rounded-full border ${t.border} ${t.btnSecondary} h-7 w-7 text-xs font-bold flex items-center justify-center`}
               >
-                {isExpanded ? <ChevronUp size={13} /> : <ChevronDown size={13} />}
-                <span>{isExpanded ? 'Hide Barcode' : 'Barcode'}</span>
+                -
               </button>
-
-              <div className="flex flex-wrap items-center gap-1.5">
-                <div className={`inline-flex items-center gap-1 rounded-xl border ${t.border} ${t.cardBg3} px-2 py-0.5 text-[11px]`}>
-                  <span className={t.textMuted}>Copies</span>
-                  <input
-                    type="number"
-                    min={1}
-                    max={100}
-                    value={copiesCount}
-                    onChange={(e) => setItemPrintCopies(item.id, parseInt(e.target.value, 10))}
-                    aria-label={`Print copies for ${item.name}`}
-                    className={`w-12 bg-transparent text-center text-base sm:text-[11px] font-bold tabular-nums outline-none ${t.text}`}
-                  />
-                  {[1, 5, 10].map((preset) => (
-                    <button
-                      key={preset}
-                      type="button"
-                      onClick={() => setItemPrintCopies(item.id, preset)}
-                      className={`rounded-md px-1 py-0.5 text-[10px] font-semibold tabular-nums transition-colors ${
-                        copiesCount === preset ? t.tabActive : `${t.textMuted} hover:opacity-80`
-                      }`}
-                    >
-                      {preset}
-                    </button>
-                  ))}
-                </div>
+              <button
+                type="button"
+                onClick={() => void adjustStock(item.id, 1, 'button')}
+                title="Add +1"
+                className={`tpd-click-press rounded-full border ${t.border} ${t.btnSecondary} h-7 w-7 text-xs font-bold flex items-center justify-center`}
+              >
+                +
+              </button>
+              <div className={`inline-flex items-center rounded-full border ${t.border} ${t.inputBg} pl-1.5 pr-1 py-0.5`}>
+                <input
+                  type="number"
+                  min={1}
+                  value={customQty}
+                  onChange={(e) => {
+                    const parsed = parseInt(e.target.value, 10);
+                    setCustomCardQty((prev) => ({
+                      ...prev,
+                      [item.id]: Number.isNaN(parsed) ? 1 : Math.max(1, parsed),
+                    }));
+                  }}
+                  aria-label={`Custom quantity for ${item.name}`}
+                  className={`w-9 bg-transparent text-center text-xs font-bold tabular-nums outline-none ${t.text}`}
+                />
                 <button
                   type="button"
-                  onClick={() => downloadBarcodePng(item)}
-                  className={`inline-flex items-center gap-1.5 rounded-xl border ${t.btnSecondary} px-2.5 py-1 text-[11px] font-semibold transition-all duration-200 ease-out motion-reduce:transition-none`}
+                  onClick={() => void adjustStock(item.id, customQty, 'button')}
+                  title={`Add +${customQty}`}
+                  className={`tpd-click-press rounded-full border ${t.btnPrimary} px-1.5 py-0.5 text-[10px] font-bold tabular-nums`}
                 >
-                  <Download size={12} />
-                  <span>Save</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => printBarcodeLabel(item, copiesCount)}
-                  className={`inline-flex items-center gap-1.5 rounded-xl border ${t.btnSecondary} px-2.5 py-1 text-[11px] font-semibold transition-all duration-200 ease-out motion-reduce:transition-none tabular-nums`}
-                >
-                  <Printer size={12} />
-                  <span>Print ({copiesCount})</span>
+                  +{customQty}
                 </button>
               </div>
             </div>
 
-            <div className={isExpanded ? 'tpd-pop-enter mt-2.5 block' : 'hidden'}>
-              <div
-                className={`inline-flex flex-col items-center rounded-xl border border-zinc-300 bg-white text-black shadow-sm ${
-                  labelFormat === 'full' ? 'px-4 py-3 min-w-[220px]' : 'px-3 py-2'
-                }`}
+            <div className="flex items-center gap-1 shrink-0">
+              <button
+                type="button"
+                onClick={() => openEditModal(item)}
+                title="Edit item"
+                aria-label="Edit item"
+                className={`tpd-click-press rounded-full border ${t.border} ${t.btnSecondary} p-1.5`}
               >
-                {labelFormat === 'full' && (
-                  <span className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-zinc-600">
-                    {item.category || 'Item'} &bull; {item.size || '-'}
-                  </span>
-                )}
-                <div className="mb-1 flex items-center justify-center gap-1.5">
-                  <span className="text-[11px] font-extrabold tracking-wider text-black">
+                <Edit3 size={12} />
+              </button>
+              <button
+                type="button"
+                onClick={() =>
+                  setConfirmDeleteItemId((prev) => (prev === item.id ? null : item.id))
+                }
+                title="Delete item"
+                aria-label="Delete item"
+                className={`tpd-click-press rounded-full border ${t.border} ${t.btnSecondary} p-1.5 ${t.dangerText}`}
+              >
+                <Trash2 size={12} />
+              </button>
+            </div>
+          </div>
+
+          {isConfirmingDelete && (
+            <div
+              className={`tpd-slide-down flex items-center justify-between gap-2 rounded-xl border ${t.needsRestockBorder} ${t.needsRestockBg} px-2.5 py-1.5 text-[11px]`}
+            >
+              <span className="font-semibold">you want to delete ?</span>
+              <div className="flex items-center gap-1 shrink-0">
+                <button
+                  type="button"
+                  onClick={() => deleteItem(item.id)}
+                  className="tpd-click-press rounded-lg border border-red-700 bg-red-600 px-2 py-0.5 text-[10px] font-bold text-white hover:bg-red-700"
+                >
+                  Yes
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setConfirmDeleteItemId(null)}
+                  className={`tpd-click-press rounded-lg border ${t.border} ${t.btnSecondary} px-2 py-0.5 text-[10px] font-semibold`}
+                >
+                  No
+                </button>
+              </div>
+            </div>
+          )}
+
+          {item.sku && (
+            <div className="flex items-center justify-between gap-1 text-[11px]">
+              <button
+                type="button"
+                onClick={() => toggleBarcodeExpand(item.id)}
+                className={`tpd-click-press inline-flex items-center gap-1 rounded-lg border ${t.border} ${t.cardBg3} px-2 py-1 text-[10px] font-semibold ${t.textMuted}`}
+              >
+                {isExpanded ? <ChevronUp size={11} /> : <ChevronDown size={11} />}
+                <span>Barcode</span>
+              </button>
+
+              <div className="flex items-center gap-1">
+                <input
+                  type="number"
+                  min={1}
+                  max={100}
+                  value={copiesCount}
+                  onChange={(e) => setItemPrintCopies(item.id, parseInt(e.target.value, 10))}
+                  aria-label={`Print copies for ${item.name}`}
+                  className={`w-9 rounded-lg border ${t.border} ${t.inputBg} px-1 py-0.5 text-center text-xs font-bold tabular-nums outline-none ${t.text}`}
+                />
+                <button
+                  type="button"
+                  onClick={() => printBarcodeLabel(item, copiesCount)}
+                  className={`inline-flex items-center gap-1 rounded-lg border ${t.btnSecondary} px-2 py-1 text-[10px] font-semibold tabular-nums`}
+                >
+                  <Printer size={11} />
+                  <span>Print</span>
+                </button>
+              </div>
+            </div>
+          )}
+
+          {item.sku && (
+            <div className={isExpanded ? 'tpd-slide-down pt-1 block' : 'hidden'}>
+              <div
+                className="flex flex-col items-center rounded-xl border border-zinc-300 bg-white text-black px-2 py-1.5"
+              >
+                <div className="mb-0.5 flex items-center justify-center gap-1">
+                  <span className="text-[10px] font-extrabold tracking-wider text-black">
                     {barcodeItemSizeLabel}
                   </span>
                   {renderLabelColorDots(item.colors)}
@@ -4004,21 +3805,24 @@ export default function InventoryDashboard() {
                   <Barcode
                     value={item.sku}
                     format="CODE128"
-                    height={labelFormat === 'full' ? 36 : 32}
-                    width={1.3}
-                    fontSize={11}
-                    margin={2}
+                    height={labelFormat === 'full' ? 32 : 26}
+                    width={1.15}
+                    fontSize={10}
+                    margin={1}
                   />
                 </div>
-                {labelFormat === 'full' && (item.colors || []).length > 0 && (
-                  <span className="mt-1 text-[10px] font-medium text-zinc-700">
-                    Colors: {(item.colors || []).join(', ')}
-                  </span>
-                )}
+                <button
+                  type="button"
+                  onClick={() => downloadBarcodePng(item)}
+                  className="mt-1 inline-flex items-center gap-1 rounded-md border border-zinc-300 bg-zinc-100 px-2 py-0.5 text-[10px] font-semibold text-zinc-800 hover:bg-zinc-200"
+                >
+                  <Download size={10} />
+                  <span>Save PNG</span>
+                </button>
               </div>
             </div>
-          </div>
-        )}
+          )}
+        </div>
       </div>
     );
   };
@@ -4028,7 +3832,7 @@ export default function InventoryDashboard() {
       <main className={`relative flex min-h-screen items-center justify-center ${t.text}`}>
         <FrostedBackgroundLayer darkMode={darkMode} />
         <div className={`relative z-10 flex flex-col items-center gap-3 rounded-3xl border ${t.border} ${t.cardBg} px-8 py-6 shadow-2xl`}>
-          <div className="h-8 w-8 animate-spin motion-reduce:animate-none rounded-full border-2 border-zinc-500 border-t-current" />
+          <PrintingDepotLogo darkMode={darkMode} size="md" spinning />
           <p className={`text-sm ${t.textMuted}`}>Loading The Printing Depot...</p>
         </div>
       </main>
@@ -4039,7 +3843,7 @@ export default function InventoryDashboard() {
     return (
       <main className={`relative flex min-h-screen items-center justify-center px-4 py-10 ${t.text} overflow-x-hidden`}>
         <FrostedBackgroundLayer darkMode={darkMode} />
-        <div className={`tpd-modal-enter relative z-10 w-full max-w-md rounded-3xl border ${t.border} ${t.cardBg2} p-6 sm:p-8 shadow-2xl transition-all duration-300 ease-out motion-reduce:transition-none`}>
+        <div className={`tpd-modal-enter relative z-10 w-full max-w-md rounded-3xl border ${t.border} ${t.cardBg2} p-6 sm:p-8 shadow-2xl transition-all duration-150 ease-out motion-reduce:transition-none`}>
           <div className="flex items-start justify-between gap-3">
             <div className="flex items-center gap-3 min-w-0">
               <PrintingDepotLogo darkMode={darkMode} size="md" />
@@ -4052,7 +3856,7 @@ export default function InventoryDashboard() {
               type="button"
               onClick={() => setDarkMode(!darkMode)}
               aria-label="Toggle theme"
-              className={`tpd-click-press shrink-0 rounded-2xl border ${t.border} ${t.cardBg} p-2.5 transition-all duration-300 ease-out motion-reduce:transition-none hover:scale-105`}
+              className={`tpd-click-press shrink-0 rounded-2xl border ${t.border} ${t.cardBg} p-2.5 transition-transform duration-150 ease-out motion-reduce:transition-none hover:scale-105`}
             >
               {darkMode ? <Sun size={18} className="text-yellow-300" /> : <Moon size={18} className="text-zinc-700" />}
             </button>
@@ -4061,26 +3865,35 @@ export default function InventoryDashboard() {
           <button
             type="button"
             onClick={handleGoogleLogin}
-            className={`mt-6 flex w-full items-center justify-center gap-3 rounded-2xl border ${t.btnSecondary} px-4 py-3 text-sm font-semibold transition-all duration-300 ease-out motion-reduce:transition-none`}
+            className={`mt-6 flex w-full items-center justify-center gap-3 rounded-2xl border ${t.btnSecondary} px-4 py-3 text-sm font-semibold transition-all duration-150 ease-out motion-reduce:transition-none`}
           >
             Continue with Google
           </button>
 
           <div className="my-5 flex items-center gap-3">
             <div className={`h-px flex-1 border-t ${t.border}`} />
-            <span className={`text-xs uppercase ${t.textMuted2}`}>or with email</span>
+            <span className={`text-xs uppercase ${t.textMuted2}`}>or with gmail</span>
             <div className={`h-px flex-1 border-t ${t.border}`} />
           </div>
 
-          {authError && <div className={`tpd-pop-enter mb-4 rounded-2xl border ${t.lowBg} px-4 py-3 text-xs font-medium`}>{authError}</div>}
-          {authMessage && <div className={`tpd-pop-enter mb-4 rounded-2xl border ${t.okBg} px-4 py-3 text-xs font-medium`}>{authMessage}</div>}
+          {authError && <div className={`tpd-slide-down mb-4 rounded-2xl border ${t.lowBg} px-4 py-3 text-xs font-medium`}>{authError}</div>}
+          {authMessage && <div className={`tpd-slide-down mb-4 rounded-2xl border ${t.okBg} px-4 py-3 text-xs font-medium`}>{authMessage}</div>}
 
           <form onSubmit={handleManualAuth} className="space-y-4">
             <div>
-              <label className={`mb-1.5 block text-xs font-medium ${t.textMuted}`}>Email Address</label>
+              <label className={`mb-1.5 block text-xs font-medium ${t.textMuted}`}>Gmail Address (@gmail.com)</label>
               <div className={`flex items-center gap-2.5 rounded-2xl border ${t.border} ${t.inputBg} px-3.5 py-2.5`}>
                 <Mail size={16} className={iconClass} />
-                <input type="email" required value={authEmail} onChange={(e) => setAuthEmail(e.target.value)} placeholder="name@printingdepot.ph" className={`w-full bg-transparent text-base sm:text-sm outline-none ${t.text}`} />
+                <input
+                  type="email"
+                  required
+                  pattern="[^@\s]+@gmail\.com"
+                  title="Email address must end with @gmail.com"
+                  value={authEmail}
+                  onChange={(e) => setAuthEmail(e.target.value)}
+                  placeholder="name@gmail.com"
+                  className={`w-full bg-transparent text-base outline-none ${t.text}`}
+                />
               </div>
             </div>
 
@@ -4088,12 +3901,57 @@ export default function InventoryDashboard() {
               <label className={`mb-1.5 block text-xs font-medium ${t.textMuted}`}>Password</label>
               <div className={`flex items-center gap-2.5 rounded-2xl border ${t.border} ${t.inputBg} px-3.5 py-2.5`}>
                 <Lock size={16} className={iconClass} />
-                <input type="password" required minLength={6} value={authPassword} onChange={(e) => setAuthPassword(e.target.value)} placeholder="••••••••" className={`w-full bg-transparent text-base sm:text-sm outline-none ${t.text}`} />
+                <input
+                  type={showAuthPassword ? 'text' : 'password'}
+                  required
+                  minLength={6}
+                  value={authPassword}
+                  onChange={(e) => setAuthPassword(e.target.value)}
+                  placeholder="••••••••"
+                  className={`w-full bg-transparent text-base outline-none ${t.text}`}
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowAuthPassword((prev) => !prev)}
+                  aria-label={showAuthPassword ? 'Hide password' : 'Show password'}
+                  title={showAuthPassword ? 'Hide password' : 'Show password'}
+                  className={`tpd-click-press shrink-0 rounded-lg p-1 ${t.textMuted}`}
+                >
+                  {showAuthPassword ? <EyeOff size={16} /> : <Eye size={16} />}
+                </button>
               </div>
             </div>
 
-            <button type="submit" disabled={authSubmitting} className={`w-full rounded-2xl border ${t.btnPrimary} px-4 py-3 text-sm font-semibold transition-all duration-300 ease-out motion-reduce:transition-none disabled:opacity-50`}>
-              {authSubmitting ? 'Please wait...' : authMode === 'login' ? 'Log In' : 'Create Account'}
+            {authMode === 'signup' && (
+              <div>
+                <label className={`mb-1.5 block text-xs font-medium ${t.textMuted}`}>Re-type Password</label>
+                <div className={`flex items-center gap-2.5 rounded-2xl border ${t.border} ${t.inputBg} px-3.5 py-2.5`}>
+                  <Lock size={16} className={iconClass} />
+                  <input
+                    type={showAuthConfirmPassword ? 'text' : 'password'}
+                    required
+                    minLength={6}
+                    value={authConfirmPassword}
+                    onChange={(e) => setAuthConfirmPassword(e.target.value)}
+                    placeholder="Re-type password"
+                    className={`w-full bg-transparent text-base outline-none ${t.text}`}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowAuthConfirmPassword((prev) => !prev)}
+                    aria-label={showAuthConfirmPassword ? 'Hide password confirmation' : 'Show password confirmation'}
+                    title={showAuthConfirmPassword ? 'Hide password confirmation' : 'Show password confirmation'}
+                    className={`tpd-click-press shrink-0 rounded-lg p-1 ${t.textMuted}`}
+                  >
+                    {showAuthConfirmPassword ? <EyeOff size={16} /> : <Eye size={16} />}
+                  </button>
+                </div>
+              </div>
+            )}
+
+            <button type="submit" disabled={authSubmitting} className={`flex w-full items-center justify-center gap-2 rounded-2xl border ${t.btnPrimary} px-4 py-3 text-sm font-semibold transition-all duration-150 ease-out motion-reduce:transition-none disabled:opacity-50`}>
+              {authSubmitting && <img src="/icon.png" alt="" className="h-4 w-4 animate-spin object-contain" />}
+              <span>{authSubmitting ? 'Please wait...' : authMode === 'login' ? 'Log In' : 'Create account'}</span>
             </button>
           </form>
 
@@ -4101,12 +3959,33 @@ export default function InventoryDashboard() {
             {authMode === 'login' ? (
               <p className={t.textMuted}>
                 Don&apos;t have an account?{' '}
-                <button type="button" onClick={() => setAuthMode('signup')} className="tpd-click-press font-semibold underline underline-offset-4">Create account</button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setAuthError(null);
+                    setAuthMessage(null);
+                    setAuthMode('signup');
+                  }}
+                  className="tpd-click-press font-semibold underline underline-offset-4"
+                >
+                  Create account
+                </button>
               </p>
             ) : (
               <p className={t.textMuted}>
                 Already have an account?{' '}
-                <button type="button" onClick={() => setAuthMode('login')} className="tpd-click-press font-semibold underline underline-offset-4">Log in</button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setAuthError(null);
+                    setAuthMessage(null);
+                    setAuthConfirmPassword('');
+                    setAuthMode('login');
+                  }}
+                  className="tpd-click-press font-semibold underline underline-offset-4"
+                >
+                  Log in
+                </button>
               </p>
             )}
           </div>
@@ -4116,6 +3995,7 @@ export default function InventoryDashboard() {
   }
 
   const allSelectableColors = Array.from(new Set([...colorOptions, ...form.colors]));
+  const allInlineSelectableColors = Array.from(new Set([...colorOptions, ...inlineNewGood.colors]));
   const currentHueHex = hsvToHex(hue, 1, 1);
   const currentMatchedName = hexToColorName(pickerHex);
 
@@ -4158,14 +4038,14 @@ export default function InventoryDashboard() {
   ).length;
 
   return (
-    <main className={`relative min-h-screen ${t.text} transition-colors duration-200 motion-reduce:transition-none overflow-x-hidden`}>
+    <main className={`relative min-h-screen ${t.text} transition-colors duration-150 motion-reduce:transition-none overflow-x-hidden`}>
       <FrostedBackgroundLayer darkMode={darkMode} />
 
       {topLowStockBanner && showLowStockPopUp && (
         <div className="fixed top-4 left-1/2 z-[60] w-full max-w-md -translate-x-1/2 px-3 pointer-events-none">
           <div
             className={`${
-              topLowStockBanner.closing ? 'tpd-msg-top-exit' : 'tpd-msg-top-enter'
+              topLowStockBanner.closing ? 'tpd-slide-out-top' : 'tpd-slide-in-top'
             } pointer-events-auto flex items-center justify-between gap-3 rounded-full border ${t.needsRestockBorder} ${t.modalBg} px-4 py-2.5 shadow-2xl`}
           >
             <div className="flex items-center gap-3 min-w-0">
@@ -4198,7 +4078,7 @@ export default function InventoryDashboard() {
       )}
 
       <div className="relative z-10 mx-auto flex max-w-7xl flex-col gap-6 px-3 sm:px-6 lg:px-8 py-4 sm:py-6">
-        <header className={`relative z-30 flex flex-col gap-4 rounded-3xl border ${t.border} ${t.cardBg} p-4 sm:p-5 shadow-2xl transition-colors duration-200 motion-reduce:transition-none lg:flex-row lg:items-center lg:justify-between`}>
+        <header className={`relative z-30 flex flex-col gap-4 rounded-3xl border ${t.border} ${t.cardBg} p-4 sm:p-5 shadow-2xl transition-colors duration-150 motion-reduce:transition-none lg:flex-row lg:items-center lg:justify-between`}>
           <div className="flex items-center justify-between lg:justify-start lg:gap-4">
             <div className="flex items-center gap-3 min-w-0 flex-1">
               <PrintingDepotLogo darkMode={darkMode} size="sm" />
@@ -4211,7 +4091,7 @@ export default function InventoryDashboard() {
             <div className="flex items-center gap-2 lg:hidden shrink-0">
               <button
                 type="button"
-                onClick={toggleNotifAnimated}
+                onClick={toggleNotifPanel}
                 aria-label="Notifications"
                 className={`tpd-click-press relative rounded-2xl border ${t.border} ${t.btnSecondary} p-2.5`}
               >
@@ -4224,7 +4104,7 @@ export default function InventoryDashboard() {
               </button>
               <button
                 type="button"
-                onClick={openSettingsAnimated}
+                onClick={openSettingsModal}
                 aria-label="Settings"
                 className={`tpd-click-press rounded-2xl border ${t.border} ${t.btnSecondary} p-2.5`}
               >
@@ -4251,7 +4131,7 @@ export default function InventoryDashboard() {
           >
             <button
               type="button"
-              onClick={toggleNotifAnimated}
+              onClick={toggleNotifPanel}
               aria-label="Notifications"
               title="Notifications"
               className={`tpd-click-press relative hidden lg:flex rounded-2xl border ${t.border} ${t.btnSecondary} p-2.5`}
@@ -4265,12 +4145,12 @@ export default function InventoryDashboard() {
             </button>
             <button
               type="button"
-              onClick={openSettingsAnimated}
+              onClick={openSettingsModal}
               aria-label="Settings"
               title="Settings"
               className={`group hidden lg:flex rounded-2xl border ${t.border} ${t.btnSecondary} p-2.5`}
             >
-              <Settings size={18} className="transition-transform duration-300 ease-out motion-reduce:transition-none group-hover:rotate-45" />
+              <Settings size={18} className="transition-transform duration-150 ease-out motion-reduce:transition-none group-hover:rotate-45" />
             </button>
             <button
               type="button"
@@ -4294,12 +4174,12 @@ export default function InventoryDashboard() {
               onClick={() => openNewDocumentModal('OUTGOING')}
               className={`group rounded-2xl border ${t.btnSecondary} px-3.5 py-3 sm:py-2.5 text-xs sm:text-sm font-semibold flex items-center justify-center gap-1.5`}
             >
-              <ArrowUpRight size={15} className={t.warnText} />
+              <ArrowUpRight size={15} className={iconClass} />
               <span>Outgoing</span>
             </button>
             <button
               type="button"
-              onClick={() => openScannerAnimated(false)}
+              onClick={() => openScannerModal(false)}
               title="Scan Barcode"
               aria-label="Scan Barcode"
               className={`group rounded-2xl border ${t.btnSecondary} px-3.5 py-3 sm:py-2.5 text-xs sm:text-sm font-semibold flex items-center justify-center gap-2`}
@@ -4325,7 +4205,7 @@ export default function InventoryDashboard() {
           </div>
 
           {isNotifOpen && (
-            <div className={`${isNotifClosing ? 'tpd-pop-exit' : 'tpd-pop-enter'} absolute right-3 top-full mt-2 z-[60] w-full max-w-sm rounded-3xl border ${t.border} ${t.modalBg} p-4 shadow-2xl`}>
+            <div className="tpd-slide-in-right absolute right-3 top-full mt-2 z-[60] w-full max-w-sm rounded-3xl border border-white/20 bg-zinc-900/95 text-white p-4 shadow-2xl backdrop-blur-2xl">
               <div className={`flex items-center justify-between gap-2 pb-3 border-b ${t.border}`}>
                 <div className="flex items-center gap-2">
                   <h3 className="text-sm font-bold">Notifications</h3>
@@ -4357,7 +4237,7 @@ export default function InventoryDashboard() {
                   )}
                   <button
                     type="button"
-                    onClick={closeNotifAnimated}
+                    onClick={closeNotifPanel}
                     aria-label="Close notifications"
                     className={`tpd-click-press rounded-xl border ${t.border} ${t.btnSecondary} p-1`}
                   >
@@ -4380,7 +4260,7 @@ export default function InventoryDashboard() {
                           prev.map((n) => (n.id === entry.id ? { ...n, read: true } : n))
                         )
                       }
-                      className={`tpd-click-press cursor-pointer rounded-2xl border p-3 transition-colors duration-150 ${
+                      className={`tpd-click-press cursor-pointer rounded-2xl border p-3 transition-colors duration-100 ${
                         entry.type === 'low_stock' ? t.needsRestockBorder : t.border
                       } ${!entry.read ? t.cardBgHover : t.cardBg3}`}
                     >
@@ -4409,7 +4289,7 @@ export default function InventoryDashboard() {
             { label: 'Low / Out', value: lowStockCount, icon: Box },
             { label: 'Categories', value: categories.length, icon: Warehouse },
           ].map((card) => (
-            <div key={card.label} className={`group rounded-3xl border ${t.border} ${t.cardBg2} p-4 sm:p-5 transition-all duration-200 ease-out motion-reduce:transition-none hover:-translate-y-0.5 hover:shadow-xl`}>
+            <div key={card.label} className={`group rounded-3xl border ${t.border} ${t.cardBg2} p-4 sm:p-5 transition-transform duration-150 ease-out motion-reduce:transition-none hover:-translate-y-0.5 hover:shadow-xl`}>
               <div className="flex items-center justify-between gap-1.5">
                 <p className={`text-xs sm:text-sm ${t.textMuted} truncate`}>{card.label}</p>
                 <card.icon className={`h-4 w-4 sm:h-5 sm:w-5 ${iconClass} shrink-0`} />
@@ -4468,44 +4348,72 @@ export default function InventoryDashboard() {
                     const dir = entry.direction || parsed.direction;
                     const meta = entry.meta || parsed.meta;
                     return (
-                      <div key={entry.id} className={`flex items-center justify-between gap-3 rounded-2xl border ${t.border} ${t.cardBg3} p-3`}>
-                        <div className="min-w-0 flex-1">
-                          <div className="flex flex-wrap items-center gap-2">
-                            <p className="font-semibold text-xs sm:text-sm truncate">{entry.item}</p>
-                            {dir === 'INCOMING' && (
-                              <span className={`rounded-full border px-2 py-0.5 text-[10px] font-bold shrink-0 ${t.incomingBadge}`}>
-                                PROCUREMENT
-                              </span>
-                            )}
-                            {dir === 'OUTGOING' && (
-                              <span className={`rounded-full border px-2 py-0.5 text-[10px] font-bold shrink-0 ${t.outgoingBadge}`}>
-                                OUTGOING
-                              </span>
-                            )}
-                            {typeof meta?.previousStock === 'number' && typeof meta?.newStock === 'number' && (
-                              <span className={`rounded-full border ${t.badgeBg} px-2 py-0.5 text-[10px] font-semibold tabular-nums`}>
-                                {meta.previousStock} → {meta.newStock}
-                              </span>
-                            )}
+                      <div key={entry.id} className={`rounded-2xl border ${t.border} ${t.cardBg3} p-3`}>
+                        <div className="flex items-center justify-between gap-3">
+                          <div className="min-w-0 flex-1">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <p className="font-semibold text-xs sm:text-sm truncate">{entry.item}</p>
+                              {dir === 'INCOMING' && (
+                                <span className={`rounded-full border px-2 py-0.5 text-[10px] font-bold shrink-0 ${t.incomingBadge}`}>
+                                  PROCUREMENT
+                                </span>
+                              )}
+                              {dir === 'OUTGOING' && (
+                                <span className={`rounded-full border px-2 py-0.5 text-[10px] font-bold shrink-0 ${t.badgeBg}`}>
+                                  OUTGOING
+                                </span>
+                              )}
+                              {typeof meta?.previousStock === 'number' && typeof meta?.newStock === 'number' && (
+                                <span className={`rounded-full border ${t.badgeBg} px-2 py-0.5 text-[10px] font-semibold tabular-nums`}>
+                                  {meta.previousStock} → {meta.newStock}
+                                </span>
+                              )}
+                            </div>
+                            <p className={`text-[11px] sm:text-xs ${t.textMuted} truncate`}>{entry.detail}</p>
+                            {entry.user && <p className={`mt-0.5 text-[10px] font-medium ${t.successText} truncate`}>By: {entry.user}</p>}
                           </div>
-                          <p className={`text-[11px] sm:text-xs ${t.textMuted} truncate`}>{entry.detail}</p>
-                          {entry.user && <p className={`mt-0.5 text-[10px] font-medium ${t.successText} truncate`}>By: {entry.user}</p>}
+                          <div className="flex items-center gap-2 shrink-0">
+                            <div className={`text-right text-[11px] sm:text-xs ${t.textMuted2}`}>
+                              <p className="font-semibold">{entry.action}</p>
+                              <p className="tabular-nums">{entry.time}</p>
+                            </div>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setConfirmDeleteAuditId((prev) => (prev === entry.id ? null : entry.id))
+                              }
+                              title="Delete audit log"
+                              aria-label="Delete audit log"
+                              className={`tpd-click-press rounded-xl border ${t.border} ${t.btnSecondary} p-1.5 ${t.dangerText}`}
+                            >
+                              <Trash2 size={13} />
+                            </button>
+                          </div>
                         </div>
-                        <div className="flex items-center gap-2 shrink-0">
-                          <div className={`text-right text-[11px] sm:text-xs ${t.textMuted2}`}>
-                            <p className="font-semibold">{entry.action}</p>
-                            <p className="tabular-nums">{entry.time}</p>
-                          </div>
-                          <button
-                            type="button"
-                            onClick={() => void deleteAuditLog(entry.id)}
-                            title="Delete audit log"
-                            aria-label="Delete audit log"
-                            className={`tpd-click-press rounded-xl border ${t.border} ${t.btnSecondary} p-1.5 ${t.dangerText}`}
+
+                        {confirmDeleteAuditId === entry.id && (
+                          <div
+                            className={`tpd-slide-down mt-2 flex items-center justify-between gap-2 rounded-xl border ${t.needsRestockBorder} ${t.needsRestockBg} px-2.5 py-1.5 text-[11px]`}
                           >
-                            <Trash2 size={13} />
-                          </button>
-                        </div>
+                            <span className="font-semibold">you want to delete ?</span>
+                            <div className="flex items-center gap-1 shrink-0">
+                              <button
+                                type="button"
+                                onClick={() => void deleteAuditLog(entry.id)}
+                                className="tpd-click-press rounded-lg border border-red-700 bg-red-600 px-2 py-0.5 text-[10px] font-bold text-white hover:bg-red-700"
+                              >
+                                Yes
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => setConfirmDeleteAuditId(null)}
+                                className={`tpd-click-press rounded-lg border ${t.border} ${t.btnSecondary} px-2 py-0.5 text-[10px] font-semibold`}
+                              >
+                                No
+                              </button>
+                            </div>
+                          </div>
+                        )}
                       </div>
                     );
                   })
@@ -4515,7 +4423,7 @@ export default function InventoryDashboard() {
           </div>
         </section>
 
-        <section className="grid gap-6 xl:grid-cols-[1.4fr_0.6fr]">
+        <section ref={inventorySectionRef} className="grid gap-6 xl:grid-cols-[1.5fr_0.5fr]">
           <div className={`rounded-3xl border ${t.border} ${t.cardBg2} p-4 sm:p-5`}>
             <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
               <div>
@@ -4548,7 +4456,7 @@ export default function InventoryDashboard() {
                 </label>
                 <button
                   type="button"
-                  onClick={() => openScannerAnimated(false)}
+                  onClick={() => openScannerModal(false)}
                   title="Scan Barcode"
                   className={`group inline-flex items-center justify-center gap-2 rounded-2xl border ${t.btnSecondary} px-3.5 py-2 text-sm font-semibold`}
                 >
@@ -4788,7 +4696,7 @@ export default function InventoryDashboard() {
                         </div>
 
                         {!isCollapsed && (
-                          <div className={`mt-3.5 space-y-3 border-t ${t.border} pt-3.5`}>
+                          <div className={`mt-3.5 grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 border-t ${t.border} pt-3.5`}>
                             {group.items.map((item) => renderInventoryCard(item))}
                           </div>
                         )}
@@ -4796,7 +4704,7 @@ export default function InventoryDashboard() {
                     );
                   })
                 ) : (
-                  <div className="space-y-3">
+                  <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
                     {filteredItems.map((item) => renderInventoryCard(item))}
                   </div>
                 )}
@@ -4822,7 +4730,7 @@ export default function InventoryDashboard() {
                 </div>
 
                 <div className="space-y-3">
-                  <h3 className={`text-xs font-extrabold uppercase tracking-wider ${activeTab === 'incoming' ? t.successText : t.warnText}`}>
+                  <h3 className={`text-xs font-extrabold uppercase tracking-wider ${activeTab === 'incoming' ? t.successText : t.textMuted}`}>
                     {activeTab === 'incoming'
                       ? `Procurement (${incomingDocuments.length})`
                       : `Outgoing (${outgoingDocuments.length})`}
@@ -4965,7 +4873,7 @@ export default function InventoryDashboard() {
                         onClick={() => {
                           if (auditSelectMode) toggleAuditSelection(entry.id);
                         }}
-                        className={`flex items-center justify-between gap-3 rounded-2xl border p-3 transition-all duration-200 ease-out motion-reduce:transition-none ${
+                        className={`rounded-2xl border p-3 transition-all duration-150 ease-out motion-reduce:transition-none ${
                           auditSelectMode ? 'cursor-pointer' : ''
                         } ${
                           isChecked
@@ -4973,41 +4881,68 @@ export default function InventoryDashboard() {
                             : `${t.border} ${t.cardBgHover}`
                         }`}
                       >
-                        <div className="flex items-center gap-3 min-w-0 flex-1">
-                          {auditSelectMode && (
-                            <input
-                              type="checkbox"
-                              checked={isChecked}
-                              onChange={() => toggleAuditSelection(entry.id)}
-                              onClick={(e) => e.stopPropagation()}
-                              aria-label={`Select audit log for ${entry.item}`}
-                              className="h-4 w-4 rounded border-zinc-600 accent-red-600 cursor-pointer shrink-0"
-                            />
-                          )}
-                          <div className="min-w-0 flex-1">
-                            <p className="font-semibold text-sm truncate">{entry.item}</p>
-                            <p className={`text-xs ${t.textMuted} truncate`}>{entry.detail}</p>
-                            {entry.user && <p className={`mt-0.5 text-[11px] font-medium ${t.successText} truncate`}>By: {entry.user}</p>}
+                        <div className="flex items-center justify-between gap-3">
+                          <div className="flex items-center gap-3 min-w-0 flex-1">
+                            {auditSelectMode && (
+                              <input
+                                type="checkbox"
+                                checked={isChecked}
+                                onChange={() => toggleAuditSelection(entry.id)}
+                                onClick={(e) => e.stopPropagation()}
+                                aria-label={`Select audit log for ${entry.item}`}
+                                className="h-4 w-4 rounded border-zinc-600 accent-red-600 cursor-pointer shrink-0"
+                              />
+                            )}
+                            <div className="min-w-0 flex-1">
+                              <p className="font-semibold text-sm truncate">{entry.item}</p>
+                              <p className={`text-xs ${t.textMuted} truncate`}>{entry.detail}</p>
+                              {entry.user && <p className={`mt-0.5 text-[11px] font-medium ${t.successText} truncate`}>By: {entry.user}</p>}
+                            </div>
+                          </div>
+                          <div className="flex items-center gap-2 shrink-0">
+                            <div className={`text-right text-xs ${t.textMuted2}`}>
+                              <p className="font-semibold">{entry.action}</p>
+                              <p className="tabular-nums">{entry.time}</p>
+                            </div>
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setConfirmDeleteAuditId((prev) => (prev === entry.id ? null : entry.id));
+                              }}
+                              title="Delete audit log"
+                              aria-label="Delete audit log"
+                              className={`tpd-click-press rounded-xl border ${t.border} ${t.btnSecondary} p-1.5 ${t.dangerText}`}
+                            >
+                              <Trash2 size={13} />
+                            </button>
                           </div>
                         </div>
-                        <div className="flex items-center gap-2 shrink-0">
-                          <div className={`text-right text-xs ${t.textMuted2}`}>
-                            <p className="font-semibold">{entry.action}</p>
-                            <p className="tabular-nums">{entry.time}</p>
-                          </div>
-                          <button
-                            type="button"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              void deleteAuditLog(entry.id);
-                            }}
-                            title="Delete audit log"
-                            aria-label="Delete audit log"
-                            className={`tpd-click-press rounded-xl border ${t.border} ${t.btnSecondary} p-1.5 ${t.dangerText}`}
+
+                        {confirmDeleteAuditId === entry.id && (
+                          <div
+                            onClick={(e) => e.stopPropagation()}
+                            className={`tpd-slide-down mt-2 flex items-center justify-between gap-2 rounded-xl border ${t.needsRestockBorder} ${t.needsRestockBg} px-2.5 py-1.5 text-[11px]`}
                           >
-                            <Trash2 size={13} />
-                          </button>
-                        </div>
+                            <span className="font-semibold">you want to delete ?</span>
+                            <div className="flex items-center gap-1 shrink-0">
+                              <button
+                                type="button"
+                                onClick={() => void deleteAuditLog(entry.id)}
+                                className="tpd-click-press rounded-lg border border-red-700 bg-red-600 px-2 py-0.5 text-[10px] font-bold text-white hover:bg-red-700"
+                              >
+                                Yes
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => setConfirmDeleteAuditId(null)}
+                                className={`tpd-click-press rounded-lg border ${t.border} ${t.btnSecondary} px-2 py-0.5 text-[10px] font-semibold`}
+                              >
+                                No
+                              </button>
+                            </div>
+                          </div>
+                        )}
                       </div>
                     );
                   })
@@ -5044,19 +4979,56 @@ export default function InventoryDashboard() {
                       <Check size={15} strokeWidth={3} className={t.successText} />
                       <span>Added</span>
                     </>
+                  ) : isAddingCategory ? (
+                    <>
+                      <img src="/icon.png" alt="" className="h-4 w-4 animate-spin object-contain" />
+                      <span>Adding...</span>
+                    </>
                   ) : (
-                    <span>{isAddingCategory ? 'Adding...' : 'Add'}</span>
+                    <span>Add</span>
                   )}
                 </button>
               </div>
               <div className="mt-4 flex flex-wrap gap-2">
                 {categories.map((category) => (
-                  <span key={category.id} className={`inline-flex items-center gap-1.5 rounded-full border ${t.badgeBg} py-1 pr-2 pl-3 text-sm`}>
-                    <span>{category.name}</span>
-                    <button type="button" onClick={() => deleteCategory(category.id, category.name)} title={`Remove ${category.name}`} className={`tpd-click-press rounded-full p-0.5 hover:${t.dangerText}`}>
-                      <X size={13} />
-                    </button>
-                  </span>
+                  <div key={category.id} className="inline-flex flex-col gap-1.5">
+                    <span className={`inline-flex items-center gap-1.5 rounded-full border ${t.badgeBg} py-1 pr-2 pl-3 text-sm`}>
+                      <span>{category.name}</span>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setConfirmDeleteCategoryId((prev) => (prev === category.id ? null : category.id))
+                        }
+                        title={`Remove ${category.name}`}
+                        className={`tpd-click-press rounded-full p-0.5 hover:${t.dangerText}`}
+                      >
+                        <X size={13} />
+                      </button>
+                    </span>
+                    {confirmDeleteCategoryId === category.id && (
+                      <div
+                        className={`tpd-slide-down flex items-center justify-between gap-2 rounded-xl border ${t.needsRestockBorder} ${t.needsRestockBg} px-2.5 py-1 text-[11px]`}
+                      >
+                        <span className="font-semibold">you want to delete ?</span>
+                        <div className="flex items-center gap-1 shrink-0">
+                          <button
+                            type="button"
+                            onClick={() => deleteCategory(category.id, category.name)}
+                            className="tpd-click-press rounded-lg border border-red-700 bg-red-600 px-2 py-0.5 text-[10px] font-bold text-white hover:bg-red-700"
+                          >
+                            Yes
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setConfirmDeleteCategoryId(null)}
+                            className={`tpd-click-press rounded-lg border ${t.border} ${t.btnSecondary} px-2 py-0.5 text-[10px] font-semibold`}
+                          >
+                            No
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                  </div>
                 ))}
               </div>
             </div>
@@ -5070,7 +5042,7 @@ export default function InventoryDashboard() {
                     onClick={copyRestockOrder}
                     className={`tpd-click-press inline-flex items-center gap-1.5 rounded-xl border ${t.btnSecondary} px-2.5 py-1 text-xs font-semibold`}
                   >
-                    {copiedRestockList ? <Check size={12} className={t.successText} /> : <Copy size={12} />}
+                    {copiedRestockList ? <Check size={12} className={t.successText} /> : <CopyIcon size={12} />}
                     <span>{copiedRestockList ? 'Copied' : 'Copy List'}</span>
                   </button>
                 )}
@@ -5093,21 +5065,23 @@ export default function InventoryDashboard() {
         </section>
       </div>
 
-      {/* Procurement & Outgoing Document Modal */}
       {docModalOpen && (
-        <div className={`${docModalClosing ? 'tpd-fade-exit' : 'tpd-fade-enter'} fixed inset-0 z-50 flex items-center justify-center ${t.overlay} p-2 sm:p-4 overflow-y-auto`}>
-          <div className={`${docModalClosing ? 'tpd-modal-exit' : 'tpd-modal-enter'} my-auto max-h-[94vh] w-full max-w-lg overflow-y-auto rounded-3xl border ${t.modalBg} p-4 sm:p-6 shadow-2xl`}>
+        <div className={`tpd-fade-in fixed inset-0 z-50 flex items-center justify-center ${t.overlay} p-2 sm:p-4 overflow-y-auto`}>
+          <div className={`tpd-modal-enter my-auto max-h-[90dvh] w-full max-w-lg overflow-y-auto rounded-3xl border ${t.modalBg} p-4 sm:p-6 shadow-2xl`}>
             <div className={`flex items-center justify-between gap-2 pb-3 border-b ${t.border}`}>
               <div className="flex items-center gap-2.5">
                 <button
                   type="button"
-                  onClick={closeDocModalAnimated}
+                  onClick={closeDocModal}
                   aria-label="Close document"
-                  className={`tpd-click-press rounded-full p-2 hover:bg-black/10 ${t.text}`}
+                  className={`tpd-click-press rounded-2xl border ${t.border} ${t.btnSecondary} p-2`}
                 >
-                  <ChevronDown size={20} className="rotate-90" />
+                  <ChevronDown size={18} className="rotate-90" />
                 </button>
                 <div>
+                  <p className={`text-[10px] uppercase tracking-[0.28em] ${t.textMuted}`}>
+                    {docKind === 'INCOMING' ? 'INCOMING STOCK' : 'OUTGOING ORDER'}
+                  </p>
                   <h3 className="text-lg sm:text-xl font-black">
                     {docKind === 'INCOMING' ? 'Procurement' : 'Outgoing'}
                   </h3>
@@ -5125,7 +5099,7 @@ export default function InventoryDashboard() {
                   onClick={() => void saveDocumentAsPending()}
                   title="Save document"
                   aria-label="Save document"
-                  className="tpd-click-press rounded-full bg-emerald-600 p-2 text-white shadow-md hover:bg-emerald-700"
+                  className="tpd-click-press rounded-full border border-emerald-400/40 bg-emerald-600 p-2 text-white shadow-md hover:bg-emerald-700"
                 >
                   <Check size={18} strokeWidth={2.5} />
                 </button>
@@ -5133,13 +5107,13 @@ export default function InventoryDashboard() {
                   type="button"
                   onClick={() => setDocMenuOpenId((prev) => (prev === 'modal' ? null : 'modal'))}
                   aria-label="More options"
-                  className={`tpd-click-press rounded-full p-2 hover:bg-black/10 ${t.text}`}
+                  className={`tpd-click-press rounded-2xl border ${t.border} ${t.btnSecondary} p-2`}
                 >
                   <MoreHorizontal size={18} />
                 </button>
 
                 {docMenuOpenId === 'modal' && (
-                  <div className={`absolute right-0 top-full mt-1 z-20 w-48 rounded-2xl border ${t.border} ${t.modalBg} p-1.5 shadow-xl text-xs`}>
+                  <div className={`tpd-slide-down absolute right-0 top-full mt-1.5 z-20 w-48 rounded-2xl border ${t.modalBg} p-1.5 shadow-2xl text-xs`}>
                     <button
                       type="button"
                       onClick={() => {
@@ -5147,7 +5121,9 @@ export default function InventoryDashboard() {
                         setDocDateTime(formatCurrentDocDateTime());
                         setDocMenuOpenId(null);
                       }}
-                      className="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-left hover:bg-black/10"
+                      className={`flex w-full items-center gap-2 rounded-xl px-3 py-2 text-left transition-colors ${
+                        darkMode ? 'hover:bg-white/10' : 'hover:bg-black/5'
+                      }`}
                     >
                       <RefreshCw size={13} />
                       <span>Reset No &amp; Time</span>
@@ -5158,7 +5134,7 @@ export default function InventoryDashboard() {
                         setDocGoods([]);
                         setDocMenuOpenId(null);
                       }}
-                      className={`flex w-full items-center gap-2 rounded-xl px-3 py-2 text-left ${t.dangerText} hover:bg-red-500/10`}
+                      className={`flex w-full items-center gap-2 rounded-xl px-3 py-2 text-left ${t.dangerText} hover:bg-red-500/15`}
                     >
                       <Trash2 size={13} />
                       <span>Clear Goods</span>
@@ -5186,7 +5162,7 @@ export default function InventoryDashboard() {
                       <input
                         value={docNo}
                         onChange={(e) => setDocNo(e.target.value)}
-                        className={`mt-0.5 w-full bg-transparent text-sm font-bold outline-none ${t.text}`}
+                        className={`mt-0.5 w-full bg-transparent text-base sm:text-sm font-bold outline-none ${t.text}`}
                       />
                     </div>
 
@@ -5209,7 +5185,7 @@ export default function InventoryDashboard() {
                       value={docCustomParty}
                       onChange={(e) => setDocCustomParty(e.target.value)}
                       placeholder={docKind === 'INCOMING' ? 'Supplier name' : 'Customer name'}
-                      className={`w-full rounded-2xl border ${t.border} ${t.inputBg} px-3.5 py-2 text-xs outline-none ${t.text}`}
+                      className={`w-full rounded-2xl border ${t.border} ${t.inputBg} px-3.5 py-2 text-base sm:text-xs outline-none ${t.text}`}
                     />
                   )}
 
@@ -5218,7 +5194,7 @@ export default function InventoryDashboard() {
                     <input
                       value={docDateTime}
                       onChange={(e) => setDocDateTime(e.target.value)}
-                      className={`mt-0.5 w-full bg-transparent text-sm font-bold tabular-nums outline-none ${t.text}`}
+                      className={`mt-0.5 w-full bg-transparent text-base sm:text-sm font-bold tabular-nums outline-none ${t.text}`}
                     />
                   </div>
 
@@ -5228,7 +5204,7 @@ export default function InventoryDashboard() {
                       value={docDescription}
                       onChange={(e) => setDocDescription(e.target.value)}
                       placeholder="Optional note"
-                      className={`mt-0.5 w-full bg-transparent text-sm outline-none ${t.text}`}
+                      className={`mt-0.5 w-full bg-transparent text-base sm:text-sm outline-none ${t.text}`}
                     />
                   </div>
                 </div>
@@ -5256,12 +5232,12 @@ export default function InventoryDashboard() {
                         value={docGoodsSearch}
                         onChange={(e) => setDocGoodsSearch(e.target.value)}
                         placeholder="Search items..."
-                        className={`w-full bg-transparent text-sm outline-none ${t.text}`}
+                        className={`w-full bg-transparent text-base sm:text-sm outline-none ${t.text}`}
                       />
                     </label>
                     <button
                       type="button"
-                      onClick={() => openScannerAnimated(true)}
+                      onClick={() => openScannerModal(true)}
                       title="Scan barcode into items"
                       aria-label="Scan barcode into items"
                       className={`tpd-click-press rounded-2xl border ${t.border} ${t.btnSecondary} p-2.5`}
@@ -5301,7 +5277,7 @@ export default function InventoryDashboard() {
                               min={1}
                               value={line.qty}
                               onChange={(e) => updateDocLineQty(line.id, parseInt(e.target.value, 10))}
-                              className={`w-12 rounded-lg border ${t.border} ${t.inputBg} px-1 py-0.5 text-center font-bold tabular-nums outline-none ${t.text}`}
+                              className={`w-12 rounded-lg border ${t.border} ${t.inputBg} px-1 py-0.5 text-center text-base font-bold tabular-nums outline-none ${t.text}`}
                             />
                             <button
                               type="button"
@@ -5313,7 +5289,7 @@ export default function InventoryDashboard() {
                             <button
                               type="button"
                               onClick={() => removeDocLine(line.id)}
-                              className={`rounded-lg p-1 ${t.dangerText} hover:bg-red-500/10`}
+                              className={`rounded-lg p-1 ${t.dangerText} hover:bg-red-500/15`}
                             >
                               <Trash2 size={13} />
                             </button>
@@ -5324,23 +5300,34 @@ export default function InventoryDashboard() {
                   )}
 
                   {addGoodPickerOpen && (
-                    <div className={`rounded-2xl border ${t.border} ${t.cardBg2} p-3 space-y-2.5`}>
+                    <div className={`tpd-slide-down rounded-2xl border ${t.border} ${t.cardBg3} p-3 space-y-2.5`}>
                       <div className="flex items-center justify-between gap-2">
                         <span className="text-xs font-bold">Select item</span>
                         <div className="flex items-center gap-2">
-                          <button
-                            type="button"
-                            onClick={() => setInlineNewGoodOpen((prev) => !prev)}
-                            className="tpd-click-press inline-flex items-center gap-1 rounded-xl bg-amber-700 px-2.5 py-1 text-[11px] font-extrabold text-white hover:bg-amber-800"
-                          >
-                            <Plus size={12} />
-                            <span>{inlineNewGoodOpen ? 'Close' : 'New Item'}</span>
-                          </button>
+                          {docKind === 'INCOMING' && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setInlineNewGoodOpen((prev) => {
+                                  const next = !prev;
+                                  if (!next) setInlineNewGoodCustomColorOpen(false);
+                                  return next;
+                                });
+                              }}
+                              className={`tpd-click-press inline-flex items-center gap-1 rounded-xl border px-2.5 py-1 text-[11px] font-bold ${
+                                inlineNewGoodOpen ? t.tabActive : t.btnSecondary
+                              }`}
+                            >
+                              <Plus size={12} />
+                              <span>{inlineNewGoodOpen ? 'Close' : 'New Item'}</span>
+                            </button>
+                          )}
                           <button
                             type="button"
                             onClick={() => {
                               setAddGoodPickerOpen(false);
                               setInlineNewGoodOpen(false);
+                              setInlineNewGoodCustomColorOpen(false);
                             }}
                             className={`text-xs ${t.textMuted}`}
                           >
@@ -5349,82 +5336,278 @@ export default function InventoryDashboard() {
                         </div>
                       </div>
 
-                      {inlineNewGoodOpen && (
-                        <div className={`rounded-2xl border ${t.border} ${t.cardBg3} p-3 space-y-2.5`}>
-                          <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
-                            <input
-                              value={inlineNewGood.name}
-                              onChange={(e) =>
-                                setInlineNewGood((prev) => ({ ...prev, name: e.target.value }))
-                              }
-                              placeholder="Item name"
-                              className={`rounded-xl border ${t.border} ${t.inputBg} px-2.5 py-1.5 text-xs outline-none ${t.text}`}
-                            />
-                            <div className="flex items-center gap-1.5">
+                      {docKind === 'INCOMING' && inlineNewGoodOpen && (
+                        <div
+                          ref={inlineNewGoodRef}
+                          className={`tpd-slide-down rounded-2xl border ${t.border} ${t.cardBg2} p-3.5 space-y-3`}
+                        >
+                          <div>
+                            <p className={`text-[10px] uppercase tracking-[0.25em] ${t.textMuted}`}>CREATE</p>
+                            <h4 className="text-base font-black">New item</h4>
+                          </div>
+
+                          <div className="grid gap-3 sm:grid-cols-2">
+                            <div className="sm:col-span-2">
+                              <label className={`mb-1 block text-xs ${t.textMuted}`}>Item Name</label>
                               <input
-                                value={inlineNewGood.sku}
+                                value={inlineNewGood.name}
                                 onChange={(e) =>
-                                  setInlineNewGood((prev) => ({ ...prev, sku: e.target.value }))
+                                  setInlineNewGood((prev) => ({ ...prev, name: e.target.value }))
                                 }
-                                placeholder="SKU"
-                                className={`flex-1 rounded-xl border ${t.border} ${t.inputBg} px-2.5 py-1.5 text-xs outline-none ${t.text}`}
+                                placeholder="Item Name"
+                                className={`w-full rounded-2xl border ${t.border} ${t.inputBg} px-3.5 py-2 text-base sm:text-sm outline-none ${t.text}`}
                               />
-                              <button
-                                type="button"
-                                onClick={() =>
-                                  setInlineNewGood((prev) => ({
-                                    ...prev,
-                                    sku: buildSkuForCategory(prev.category),
-                                  }))
-                                }
-                                className={`rounded-xl border ${t.border} ${t.btnSecondary} px-2 py-1.5 text-[10px] font-bold shrink-0`}
-                              >
-                                Auto
-                              </button>
                             </div>
-                            <CascadeSelect
-                              value={inlineNewGood.category}
-                              onChange={(valCat) =>
-                                setInlineNewGood((prev) => ({ ...prev, category: valCat }))
-                              }
-                              options={
-                                modalCategoryOptions.length > 0
-                                  ? modalCategoryOptions
-                                  : [{ value: 'General', label: 'General' }]
-                              }
-                              darkMode={darkMode}
-                              fullWidth
-                            />
-                            <div className="grid grid-cols-2 gap-1.5">
+
+                            <div>
+                              <label className={`mb-1 block text-xs ${t.textMuted}`}>SKU / Barcode</label>
+                              <div className="flex items-center gap-2">
+                                <input
+                                  value={inlineNewGood.sku}
+                                  onChange={(e) =>
+                                    setInlineNewGood((prev) => ({ ...prev, sku: e.target.value }))
+                                  }
+                                  placeholder="Scan or type SKU"
+                                  className={`w-full rounded-2xl border ${t.border} ${t.inputBg} px-3.5 py-2 text-base sm:text-sm outline-none ${t.text}`}
+                                />
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    setInlineNewGood((prev) => ({
+                                      ...prev,
+                                      sku: buildSkuForCategory(prev.category),
+                                    }))
+                                  }
+                                  className={`tpd-click-press shrink-0 rounded-2xl border ${t.btnSecondary} px-3 py-2 text-xs font-semibold`}
+                                >
+                                  Auto
+                                </button>
+                              </div>
+                            </div>
+
+                            <div>
+                              <label className={`mb-1 block text-xs ${t.textMuted}`}>Category</label>
+                              <CascadeSelect
+                                value={inlineNewGood.category}
+                                onChange={(valCat) =>
+                                  setInlineNewGood((prev) => ({ ...prev, category: valCat }))
+                                }
+                                options={
+                                  modalCategoryOptions.length > 0
+                                    ? modalCategoryOptions
+                                    : [{ value: 'General', label: 'General' }]
+                                }
+                                darkMode={darkMode}
+                                fullWidth
+                              />
+                            </div>
+
+                            <div>
+                              <label className={`mb-1 block text-xs ${t.textMuted}`}>Size / Type</label>
                               <input
                                 value={inlineNewGood.size}
                                 onChange={(e) =>
                                   setInlineNewGood((prev) => ({ ...prev, size: e.target.value }))
                                 }
-                                placeholder="Size"
-                                className={`rounded-xl border ${t.border} ${t.inputBg} px-2.5 py-1.5 text-xs outline-none ${t.text}`}
+                                placeholder="M"
+                                className={`w-full rounded-2xl border ${t.border} ${t.inputBg} px-3.5 py-2 text-base sm:text-sm outline-none ${t.text}`}
                               />
+                            </div>
+
+                            <div>
+                              <label className={`mb-1 block text-xs ${t.textMuted}`}>Stock</label>
                               <input
                                 type="number"
-                                min={1}
-                                value={inlineNewGood.qty}
+                                min={0}
+                                value={inlineNewGood.stock}
                                 onChange={(e) =>
-                                  setInlineNewGood((prev) => ({ ...prev, qty: e.target.value }))
+                                  setInlineNewGood((prev) => ({ ...prev, stock: e.target.value }))
                                 }
-                                placeholder="Qty"
-                                className={`rounded-xl border ${t.border} ${t.inputBg} px-2.5 py-1.5 text-xs font-bold tabular-nums outline-none ${t.text}`}
+                                className={`w-full rounded-2xl border ${t.border} ${t.inputBg} px-3.5 py-2 text-base sm:text-sm tabular-nums outline-none ${t.text}`}
                               />
+                            </div>
+
+                            <div className="sm:col-span-2">
+                              <label className={`mb-1 block text-xs ${t.textMuted}`}>Min Stock</label>
+                              <input
+                                type="number"
+                                min={0}
+                                value={inlineNewGood.min}
+                                onChange={(e) =>
+                                  setInlineNewGood((prev) => ({ ...prev, min: e.target.value }))
+                                }
+                                className={`w-full rounded-2xl border ${t.border} ${t.inputBg} px-3.5 py-2 text-base sm:text-sm tabular-nums outline-none ${t.text}`}
+                              />
+                            </div>
+
+                            <div className="sm:col-span-2">
+                              <div className="mb-1.5 flex items-center justify-between gap-2">
+                                <label className={`text-xs ${t.textMuted}`}>Colors</label>
+                                <button
+                                  type="button"
+                                  onClick={() => setInlineNewGoodCustomColorOpen((prev) => !prev)}
+                                  className={`tpd-click-press inline-flex items-center gap-1 rounded-full border ${t.btnSecondary} px-2.5 py-1 text-[11px] font-semibold`}
+                                >
+                                  <Palette size={12} />
+                                  <span>{inlineNewGoodCustomColorOpen ? 'Hide Custom Color' : 'Custom Color'}</span>
+                                </button>
+                              </div>
+
+                              <div className="flex flex-wrap gap-1.5">
+                                {allInlineSelectableColors.map((color) => {
+                                  const active = inlineNewGood.colors.includes(color);
+                                  return (
+                                    <button
+                                      key={color}
+                                      type="button"
+                                      onClick={() =>
+                                        setInlineNewGood((prev) => ({
+                                          ...prev,
+                                          colors: prev.colors.includes(color)
+                                            ? prev.colors.filter((c) => c !== color)
+                                            : [...prev.colors, color],
+                                        }))
+                                      }
+                                      className={`group flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-medium ${
+                                        active ? t.tabActive : t.tabInactive
+                                      }`}
+                                    >
+                                      <ColorCircle color={color} size="sm" />
+                                      <span>{color}</span>
+                                    </button>
+                                  );
+                                })}
+                              </div>
+
+                              {inlineNewGoodCustomColorOpen && (
+                                <div className={`tpd-slide-down mt-2.5 rounded-2xl border ${t.border} ${t.cardBg3} p-3 space-y-3`}>
+                                  <div className="flex flex-wrap gap-1.5">
+                                    {FEATURED_SWATCHES.map((swatchName) => {
+                                      const swatchHex = getColorFill(swatchName);
+                                      const isCurrent =
+                                        previewSwatchName === swatchName ||
+                                        pickerHex.toLowerCase() === swatchHex.toLowerCase();
+                                      return (
+                                        <button
+                                          key={swatchName}
+                                          type="button"
+                                          onClick={() => handleQuickSwatchSelect(swatchName)}
+                                          title={swatchName}
+                                          aria-label={swatchName}
+                                          className={`tpd-click-press h-6 w-6 rounded-full border transition-transform duration-100 hover:scale-110 ${
+                                            isCurrent
+                                              ? 'ring-2 ring-sky-400 scale-110 border-white'
+                                              : 'border-zinc-500/50'
+                                          }`}
+                                          style={{ backgroundColor: swatchHex }}
+                                        />
+                                      );
+                                    })}
+                                  </div>
+
+                                  <div
+                                    role="slider"
+                                    tabIndex={0}
+                                    aria-label="Color saturation and brightness"
+                                    aria-valuemin={0}
+                                    aria-valuemax={100}
+                                    aria-valuenow={Math.round(sat * 100)}
+                                    onPointerDown={(e) => {
+                                      e.currentTarget.setPointerCapture(e.pointerId);
+                                      updateSvFromPointer(e.clientX, e.clientY, e.currentTarget.getBoundingClientRect());
+                                    }}
+                                    onPointerMove={(e) => {
+                                      if (e.buttons === 1 || e.pointerType === 'touch') {
+                                        updateSvFromPointer(e.clientX, e.clientY, e.currentTarget.getBoundingClientRect());
+                                      }
+                                    }}
+                                    className="relative h-28 w-full cursor-crosshair touch-none select-none rounded-xl border border-zinc-500/40 overflow-hidden"
+                                    style={{ backgroundColor: currentHueHex }}
+                                  >
+                                    <div
+                                      className="absolute inset-0"
+                                      style={{
+                                        background: 'linear-gradient(to right, #ffffff, rgba(255,255,255,0))',
+                                      }}
+                                    />
+                                    <div
+                                      className="absolute inset-0"
+                                      style={{
+                                        background: 'linear-gradient(to top, #000000, rgba(0,0,0,0))',
+                                      }}
+                                    />
+                                    <div
+                                      className="pointer-events-none absolute h-3.5 w-3.5 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-white shadow-[0_0_0_1.5px_rgba(0,0,0,0.75)]"
+                                      style={{
+                                        left: `${sat * 100}%`,
+                                        top: `${(1 - val) * 100}%`,
+                                        backgroundColor: pickerHex,
+                                      }}
+                                    />
+                                  </div>
+
+                                  <input
+                                    type="range"
+                                    min={0}
+                                    max={360}
+                                    value={Math.round(hue)}
+                                    onChange={(e) => updateHueFromValue(Number(e.target.value))}
+                                    aria-label="Hue slider"
+                                    className="tpd-hue-slider w-full cursor-pointer"
+                                  />
+
+                                  <div className="flex flex-wrap items-center justify-between gap-2">
+                                    <div className="flex items-center gap-2 min-w-0">
+                                      <span
+                                        className="h-6 w-6 shrink-0 rounded-full border border-zinc-500/50"
+                                        style={{ backgroundColor: pickerHex }}
+                                      />
+                                      <span className="text-xs font-bold truncate">
+                                        {previewSwatchName ?? currentMatchedName}
+                                      </span>
+                                      <span className={`text-[10px] font-mono ${t.textMuted2}`}>{pickerHex}</span>
+                                    </div>
+
+                                    <div className="flex items-center gap-1.5 shrink-0">
+                                      <button
+                                        type="button"
+                                        onClick={() => addColorToInlineNewGood(previewSwatchName ?? currentMatchedName)}
+                                        className={`tpd-click-press rounded-xl border ${t.btnSecondary} px-2.5 py-1 text-[11px] font-semibold`}
+                                      >
+                                        + {previewSwatchName ?? currentMatchedName}
+                                      </button>
+                                      <button
+                                        type="button"
+                                        onClick={() => addColorToInlineNewGood(pickerHex)}
+                                        className={`tpd-click-press rounded-xl border ${t.btnPrimary} px-2.5 py-1 text-[11px] font-semibold`}
+                                      >
+                                        + {pickerHex}
+                                      </button>
+                                    </div>
+                                  </div>
+                                </div>
+                              )}
                             </div>
                           </div>
 
-                          <div className="flex justify-end">
+                          <div className="flex justify-end gap-2 pt-1">
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setInlineNewGoodOpen(false);
+                                setInlineNewGoodCustomColorOpen(false);
+                              }}
+                              className={`tpd-click-press rounded-2xl border ${t.border} ${t.btnSecondary} px-3.5 py-1.5 text-xs font-semibold`}
+                            >
+                              Cancel
+                            </button>
                             <button
                               type="button"
                               onClick={addInlineNewItemToDocument}
                               disabled={!inlineNewGood.name.trim()}
-                              className={`tpd-click-press rounded-xl border ${t.btnPrimary} px-3.5 py-1.5 text-xs font-bold disabled:opacity-40`}
+                              className={`tpd-click-press rounded-2xl border ${t.btnPrimary} px-4 py-1.5 text-xs font-bold disabled:opacity-40`}
                             >
-                              Add Item
+                              Create item
                             </button>
                           </div>
                         </div>
@@ -5434,26 +5617,28 @@ export default function InventoryDashboard() {
                         value={addGoodCatalogQuery}
                         onChange={(e) => setAddGoodCatalogQuery(e.target.value)}
                         placeholder="Filter items..."
-                        className={`w-full rounded-xl border ${t.border} ${t.inputBg} px-3 py-1.5 text-xs outline-none ${t.text}`}
+                        className={`w-full rounded-xl border ${t.border} ${t.inputBg} px-3 py-2 text-base sm:text-xs outline-none ${t.text}`}
                       />
                       <div className="max-h-36 overflow-y-auto space-y-1">
                         {catalogSearchResults.length === 0 ? (
                           <div className="py-3 text-center space-y-2">
                             <p className={`text-xs ${t.textMuted}`}>No matching items.</p>
-                            <button
-                              type="button"
-                              onClick={() => {
-                                setInlineNewGood((prev) => ({
-                                  ...prev,
-                                  name: addGoodCatalogQuery.trim(),
-                                }));
-                                setInlineNewGoodOpen(true);
-                              }}
-                              className="tpd-click-press inline-flex items-center gap-1 rounded-xl bg-amber-700 px-3 py-1.5 text-xs font-bold text-white hover:bg-amber-800"
-                            >
-                              <Plus size={12} />
-                              <span>Create &ldquo;{addGoodCatalogQuery.trim() || 'Item'}&rdquo;</span>
-                            </button>
+                            {docKind === 'INCOMING' && (
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setInlineNewGood((prev) => ({
+                                    ...prev,
+                                    name: addGoodCatalogQuery.trim(),
+                                  }));
+                                  setInlineNewGoodOpen(true);
+                                }}
+                                className={`tpd-click-press inline-flex items-center gap-1 rounded-xl border ${t.btnPrimary} px-3 py-1.5 text-xs font-bold`}
+                              >
+                                <Plus size={12} />
+                                <span>Create &ldquo;{addGoodCatalogQuery.trim() || 'Item'}&rdquo;</span>
+                              </button>
+                            )}
                           </div>
                         ) : (
                           catalogSearchResults.map((invItem) => (
@@ -5466,7 +5651,7 @@ export default function InventoryDashboard() {
                               <span className="font-semibold truncate">
                                 {invItem.name} <span className={t.textMuted2}>({invItem.size} • {invItem.stock})</span>
                               </span>
-                              <span className="rounded-lg bg-amber-700 px-2 py-0.5 text-[10px] font-bold text-white shrink-0">
+                              <span className={`rounded-lg border ${t.btnPrimary} px-2 py-0.5 text-[10px] font-bold shrink-0`}>
                                 + Add
                               </span>
                             </button>
@@ -5480,14 +5665,14 @@ export default function InventoryDashboard() {
                     <button
                       type="button"
                       onClick={() => setAddGoodPickerOpen((prev) => !prev)}
-                      className="tpd-click-press rounded-2xl bg-amber-700 px-4 py-3 text-xs sm:text-sm font-extrabold text-white shadow-md hover:bg-amber-800"
+                      className={`rounded-2xl border ${t.btnPrimary} px-4 py-3 text-xs sm:text-sm font-bold`}
                     >
                       Add item
                     </button>
                     <button
                       type="button"
-                      onClick={() => openScannerAnimated(true)}
-                      className={`tpd-click-press rounded-2xl border-2 border-amber-700 bg-transparent px-4 py-3 text-xs sm:text-sm font-extrabold ${t.warnText} hover:bg-amber-700/10`}
+                      onClick={() => openScannerModal(true)}
+                      className={`rounded-2xl border ${t.btnSecondary} px-4 py-3 text-xs sm:text-sm font-bold`}
                     >
                       Scan item
                     </button>
@@ -5500,8 +5685,8 @@ export default function InventoryDashboard() {
       )}
 
       {isSettingsOpen && (
-        <div className={`${isSettingsClosing ? 'tpd-fade-exit' : 'tpd-fade-enter'} fixed inset-0 z-50 flex items-center justify-center ${t.overlay} p-3 sm:p-4 overflow-y-auto`}>
-          <div className={`${isSettingsClosing ? 'tpd-modal-exit' : 'tpd-modal-enter'} my-auto max-h-[90vh] overflow-y-auto w-full max-w-md rounded-3xl border ${t.modalBg} p-4 sm:p-6 shadow-2xl`}>
+        <div className={`tpd-fade-in fixed inset-0 z-50 flex items-center justify-center ${t.overlay} p-3 sm:p-4 overflow-y-auto`}>
+          <div className={`tpd-modal-enter my-auto max-h-[90dvh] overflow-y-auto w-full max-w-md rounded-3xl border ${t.modalBg} p-4 sm:p-6 shadow-2xl`}>
             <div className="flex items-center justify-between">
               <div>
                 <p className={`text-xs uppercase tracking-[0.3em] ${t.textMuted}`}>PREFERENCES</p>
@@ -5509,7 +5694,7 @@ export default function InventoryDashboard() {
               </div>
               <button
                 type="button"
-                onClick={closeSettingsAnimated}
+                onClick={closeSettingsModal}
                 className={`tpd-click-press rounded-full border ${t.border} ${t.btnSecondary} px-3 py-1 text-xs`}
               >
                 Close
@@ -5613,18 +5798,14 @@ export default function InventoryDashboard() {
 
               <div className={`rounded-2xl border ${t.needsRestockBorder} ${t.needsRestockBg} p-3.5`}>
                 <p className={`text-sm font-bold ${t.dangerText}`}>Delete Account</p>
-                <p className={`text-xs ${t.textMuted} mt-0.5`}>
-                  Sign out and log a deletion request for <span className="font-semibold">{user.email || actorName}</span>.
-                </p>
-
+                <p className={`text-xs ${t.textMuted} mt-0.5`}>Sign out and log deletion request</p>
                 {!confirmDeleteAccount ? (
                   <button
                     type="button"
                     onClick={() => setConfirmDeleteAccount(true)}
-                    className={`mt-3 inline-flex items-center gap-1.5 rounded-xl border ${t.btnDangerSubtle} px-3.5 py-2 text-xs font-bold`}
+                    className={`mt-3 rounded-xl border ${t.btnDangerSubtle} px-3 py-1.5 text-xs font-bold`}
                   >
-                    <Trash2 size={13} />
-                    <span>Delete Account</span>
+                    Delete Account
                   </button>
                 ) : (
                   <div className="mt-3 flex flex-wrap items-center gap-2">
@@ -5632,14 +5813,14 @@ export default function InventoryDashboard() {
                       type="button"
                       onClick={handleDeleteAccount}
                       disabled={isDeletingAccount}
-                      className="tpd-click-press inline-flex items-center gap-1.5 rounded-xl border border-red-700 bg-red-600 px-3.5 py-2 text-xs font-bold text-white hover:bg-red-700 disabled:opacity-60"
+                      className="tpd-click-press rounded-xl border border-red-700 bg-red-600 px-3 py-1.5 text-xs font-bold text-white hover:bg-red-700 disabled:opacity-60"
                     >
-                      <span>{isDeletingAccount ? 'Deleting...' : 'Confirm'}</span>
+                      {isDeletingAccount ? 'Deleting...' : 'Confirm Delete'}
                     </button>
                     <button
                       type="button"
                       onClick={() => setConfirmDeleteAccount(false)}
-                      className={`tpd-click-press rounded-xl border ${t.btnSecondary} px-3.5 py-2 text-xs font-semibold`}
+                      className={`tpd-click-press rounded-xl border ${t.btnSecondary} px-3 py-1.5 text-xs font-semibold`}
                     >
                       Cancel
                     </button>
@@ -5647,68 +5828,95 @@ export default function InventoryDashboard() {
                 )}
               </div>
             </div>
-
-            <div className="mt-6 flex justify-end">
-              <button
-                type="button"
-                onClick={closeSettingsAnimated}
-                className={`rounded-2xl border ${t.btnPrimary} px-5 py-2 text-sm font-semibold`}
-              >
-                Done
-              </button>
-            </div>
           </div>
         </div>
       )}
 
       {isScannerOpen && (
-        <div className={`${isScannerClosing ? 'tpd-fade-exit' : 'tpd-fade-enter'} fixed inset-0 z-50 flex items-center justify-center ${t.overlay} p-2 sm:p-4 overflow-y-auto`}>
-          <div className={`${isScannerClosing ? 'tpd-modal-exit' : 'tpd-modal-enter'} my-auto max-h-[92dvh] overflow-y-auto w-full max-w-sm sm:max-w-md rounded-3xl border ${t.modalBg} p-3.5 sm:p-6 shadow-2xl`}>
+        <div className={`tpd-fade-in fixed inset-0 z-50 flex items-center justify-center ${t.overlay} p-3 sm:p-4 overflow-y-auto`}>
+          <div className={`tpd-modal-enter my-auto max-h-[90dvh] overflow-y-auto w-full max-w-lg rounded-3xl border ${t.modalBg} p-4 sm:p-6 shadow-2xl`}>
             <div className="flex items-center justify-between gap-2">
-              <div className="min-w-0">
-                <p className={`text-[10px] sm:text-xs uppercase tracking-[0.25em] ${t.textMuted} truncate`}>
-                  {docModalOpen ? `SCAN • ${docNo}` : 'SCANNER'}
-                </p>
-                <h3 className="text-lg sm:text-xl font-black truncate">
-                  {docModalOpen ? 'Scan into document' : 'Scan barcode'}
+              <div>
+                <p className={`text-xs uppercase tracking-[0.3em] ${t.textMuted}`}>BARCODE SCANNER</p>
+                <h3 className="text-xl sm:text-2xl font-black">
+                  {docModalOpen ? `Scan into ${docNo}` : 'Scan Barcode'}
                 </h3>
               </div>
               <button
                 type="button"
-                onClick={closeScannerAnimated}
-                className={`tpd-click-press shrink-0 rounded-full border ${t.border} ${t.btnSecondary} px-3 py-1 text-xs`}
+                onClick={closeScannerModal}
+                className={`tpd-click-press rounded-full border ${t.border} ${t.btnSecondary} px-3 py-1 text-xs`}
               >
                 Close
               </button>
             </div>
 
-            <div className="mt-2.5 flex items-center justify-between gap-2">
-              <button
-                type="button"
-                onClick={() => setContinuousScan((prev) => !prev)}
-                className={`tpd-click-press inline-flex items-center gap-1 rounded-2xl border px-2.5 py-1.5 text-[11px] font-semibold ${
-                  continuousScan ? t.tabActive : t.tabInactive
-                }`}
-              >
-                <Repeat size={12} />
-                <span>Continuous: {continuousScan ? 'On' : 'Off'}</span>
-              </button>
+            {!docModalOpen && (
+              <div className="mt-4 space-y-3">
+                <div className="grid grid-cols-3 gap-2">
+                  {(
+                    [
+                      { id: 'search', label: 'Find SKU' },
+                      { id: 'add', label: 'Add Stock' },
+                      { id: 'deduct', label: 'Deduct Stock' },
+                    ] as const
+                  ).map((option) => (
+                    <button
+                      key={option.id}
+                      type="button"
+                      onClick={() => setScanMode(option.id)}
+                      className={`rounded-2xl border px-3 py-2 text-xs font-semibold ${
+                        scanMode === option.id ? t.tabActive : t.tabInactive
+                      }`}
+                    >
+                      {option.label}
+                    </button>
+                  ))}
+                </div>
+
+                {scanMode !== 'search' && (
+                  <div className="flex items-center justify-between gap-3">
+                    <span className={`text-xs font-medium ${t.textMuted}`}>Quantity per scan:</span>
+                    <input
+                      type="number"
+                      min={1}
+                      value={scanQuantity}
+                      onChange={(event) => setScanQuantity(Math.max(1, Number(event.target.value) || 1))}
+                      className={`w-24 rounded-2xl border ${t.border} ${t.inputBg} px-3 py-1.5 text-base sm:text-sm font-bold tabular-nums outline-none ${t.text}`}
+                    />
+                  </div>
+                )}
+              </div>
+            )}
+
+            <div className="mt-3 flex flex-wrap items-center justify-between gap-2">
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setContinuousScan((prev) => !prev)}
+                  className={`tpd-click-press inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-semibold ${
+                    continuousScan ? t.tabActive : t.tabInactive
+                  }`}
+                >
+                  <Repeat size={12} />
+                  <span>Continuous: {continuousScan ? 'On' : 'Off'}</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setScanSoundEnabled((prev) => !prev)}
+                  className={`tpd-click-press inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-semibold ${
+                    scanSoundEnabled ? t.tabActive : t.tabInactive
+                  }`}
+                >
+                  {scanSoundEnabled ? <Volume2 size={12} /> : <VolumeX size={12} />}
+                  <span>Sound: {scanSoundEnabled ? 'On' : 'Off'}</span>
+                </button>
+              </div>
 
               <button
                 type="button"
-                onClick={() => setScanSoundEnabled((prev) => !prev)}
-                className={`tpd-click-press inline-flex items-center gap-1 rounded-2xl border px-2.5 py-1.5 text-[11px] font-semibold ${
-                  scanSoundEnabled ? t.tabActive : t.tabInactive
-                }`}
-              >
-                {scanSoundEnabled ? <Volume2 size={12} /> : <VolumeX size={12} />}
-                <span>Beep: {scanSoundEnabled ? 'On' : 'Off'}</span>
-              </button>
-
-              <button
-                type="button"
-                onClick={() => setCameraRestartNonce((n) => n + 1)}
-                className={`tpd-click-press inline-flex items-center gap-1 rounded-2xl border ${t.tabInactive} px-2.5 py-1.5 text-[11px] font-semibold`}
+                onClick={() => setCameraRestartNonce((prev) => prev + 1)}
+                className={`tpd-click-press inline-flex items-center gap-1 rounded-full border ${t.border} ${t.btnSecondary} px-3 py-1 text-xs font-semibold`}
               >
                 <RefreshCw size={12} />
                 <span>Retry</span>
@@ -5716,107 +5924,73 @@ export default function InventoryDashboard() {
             </div>
 
             {scanSuccessBanner && (
-              <div className={`tpd-scan-success mt-2.5 flex items-center gap-2 rounded-2xl border ${t.okBg} px-3 py-2 text-xs font-bold shadow-lg`}>
-                <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-emerald-600 text-white">
-                  <Check size={12} strokeWidth={3} />
-                </span>
-                <span className="truncate">{scanSuccessBanner}</span>
-              </div>
-            )}
-
-            {!docModalOpen && (
-              <div className="mt-3 grid grid-cols-3 gap-1.5">
-                {(['search', 'add', 'deduct'] as ScanActionMode[]).map((mode) => (
-                  <button
-                    key={mode}
-                    type="button"
-                    onClick={() => {
-                      setScanMode(mode);
-                      setScanFeedback(null);
-                    }}
-                    className={`rounded-2xl border px-2 py-2 text-xs font-semibold ${
-                      scanMode === mode ? t.tabActive : t.tabInactive
-                    }`}
-                  >
-                    {mode === 'search' ? 'Find' : mode === 'add' ? 'Add' : 'Deduct'}
-                  </button>
-                ))}
-              </div>
-            )}
-
-            {(docModalOpen || scanMode !== 'search') && (
-              <div className="mt-2.5">
-                <div className="flex items-center justify-between gap-2 mb-1">
-                  <label className={`block text-[11px] ${t.textMuted}`}>Qty per scan</label>
-                  <div className="flex items-center gap-1">
-                    {[1, 5, 10, 25].map((preset) => (
-                      <button
-                        key={preset}
-                        type="button"
-                        onClick={() => setScanQuantity(preset)}
-                        className={`rounded-lg border px-2 py-0.5 text-[11px] font-bold tabular-nums ${
-                          scanQuantity === preset ? t.tabActive : t.tabInactive
-                        }`}
-                      >
-                        {preset}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-                <input
-                  type="number"
-                  min={1}
-                  value={scanQuantity}
-                  onChange={(e) => setScanQuantity(Math.max(1, parseInt(e.target.value, 10) || 1))}
-                  className={`w-full rounded-2xl border ${t.border} ${t.inputBg} px-3.5 py-2 text-base sm:text-sm font-bold tabular-nums outline-none ${t.text}`}
-                />
-              </div>
-            )}
-
-            <div className="mt-3">
               <div
-                id="barcode-camera-reader"
-                className={`relative w-full aspect-[4/3] max-h-[210px] sm:max-h-[235px] overflow-hidden rounded-2xl border ${t.border} bg-black [&_video]:h-full [&_video]:w-full [&_video]:object-cover`}
-              />
-              {scannerError && (
-                <div className={`mt-2 rounded-2xl border ${t.lowBg} px-3 py-2 text-xs font-medium`}>
-                  {scannerError}
+                className={`tpd-slide-down mt-3 flex items-center justify-between gap-2 rounded-2xl border ${t.needsRestockBorder} ${t.needsRestockBg} px-3.5 py-2 text-xs font-bold`}
+              >
+                <div className="flex items-center gap-2 min-w-0">
+                  <span className="h-2.5 w-2.5 rounded-full bg-emerald-500 shrink-0" />
+                  <span className="truncate">{scanSuccessBanner}</span>
                 </div>
-              )}
-              {scanFeedback && (
-                <div className={`tpd-pop-enter mt-2 rounded-2xl border ${t.okBg} px-3 py-2 text-xs font-medium`}>
-                  {scanFeedback}
-                </div>
-              )}
+                <button
+                  type="button"
+                  onClick={() => setScanSuccessBanner(null)}
+                  aria-label="Dismiss scan alert"
+                  className={`tpd-click-press rounded-lg p-1 ${t.textMuted} shrink-0`}
+                >
+                  <X size={12} />
+                </button>
+              </div>
+            )}
+
+            <div className={`tpd-scanner-frame mt-4 overflow-hidden rounded-2xl border ${t.border} bg-black`}>
+              <div id="barcode-camera-reader" className="min-h-[240px] w-full" />
             </div>
+
+            {scannerError && (
+              <div className={`mt-3 rounded-2xl border ${t.lowBg} px-3.5 py-2.5 text-xs font-medium flex items-center justify-between gap-2`}>
+                <span>{scannerError}</span>
+                <button
+                  type="button"
+                  onClick={() => setCameraRestartNonce((prev) => prev + 1)}
+                  className={`tpd-click-press shrink-0 rounded-xl border ${t.btnPrimary} px-2.5 py-1 text-[11px] font-bold`}
+                >
+                  Retry
+                </button>
+              </div>
+            )}
+
+            {scanFeedback && (
+              <div className={`mt-3 rounded-2xl border ${t.border} ${t.cardBg3} px-3.5 py-2.5 text-xs font-medium`}>
+                {scanFeedback}
+              </div>
+            )}
           </div>
         </div>
       )}
 
       {isModalOpen && (
-        <div className={`${isModalClosing ? 'tpd-fade-exit' : 'tpd-fade-enter'} fixed inset-0 z-50 flex items-center justify-center ${t.overlay} p-3 sm:p-4 overflow-y-auto`}>
-          <div className={`${isModalClosing ? 'tpd-modal-exit' : 'tpd-modal-enter'} my-auto max-h-[90vh] overflow-y-auto w-full max-w-lg rounded-3xl border ${t.modalBg} p-4 sm:p-6 shadow-2xl`}>
+        <div className={`tpd-fade-in fixed inset-0 z-50 flex items-center justify-center ${t.overlay} p-3 sm:p-4 overflow-y-auto`}>
+          <div className={`tpd-modal-enter my-auto max-h-[90dvh] overflow-y-auto w-full max-w-lg rounded-3xl border ${t.modalBg} p-4 sm:p-6 shadow-2xl`}>
             <div className="flex items-center justify-between">
               <div>
-                <p className={`text-xs uppercase tracking-[0.3em] ${t.textMuted}`}>{editingId ? 'UPDATE' : 'CREATE'}</p>
+                <p className={`text-xs uppercase tracking-[0.3em] ${t.textMuted}`}>{editingId ? 'EDIT' : 'CREATE'}</p>
                 <h3 className="text-xl sm:text-2xl font-black">{editingId ? 'Edit item' : 'New item'}</h3>
               </div>
-              <button onClick={closeModalAnimated} className={`tpd-click-press rounded-full border ${t.border} ${t.btnSecondary} px-3 py-1 text-xs`}>Close</button>
+              <button onClick={closeItemModal} className={`tpd-click-press rounded-full border ${t.border} ${t.btnSecondary} px-3 py-1 text-xs`}>Close</button>
             </div>
             <div className="mt-5 grid gap-4 sm:grid-cols-2">
               <div className="sm:col-span-2">
                 <label className={`mb-1 block text-xs ${t.textMuted}`}>Item Name</label>
-                <input value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} className={`w-full rounded-2xl border ${t.border} ${t.inputBg} px-3.5 py-2 text-base sm:text-sm outline-none ${t.text}`} />
+                <input value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} placeholder="Item Name" className={`w-full rounded-2xl border ${t.border} ${t.inputBg} px-3.5 py-2.5 text-base sm:text-sm outline-none ${t.text}`} />
               </div>
               <div>
                 <label className={`mb-1 block text-xs ${t.textMuted}`}>SKU / Barcode</label>
                 <div className="flex items-center gap-2">
-                  <input value={form.sku} onChange={(event) => setForm({ ...form, sku: event.target.value })} placeholder="Scan or type SKU" className={`w-full rounded-2xl border ${t.border} ${t.inputBg} px-3.5 py-2 text-base sm:text-sm outline-none ${t.text}`} />
+                  <input value={form.sku} onChange={(event) => setForm({ ...form, sku: event.target.value })} placeholder="Scan or type SKU" className={`w-full rounded-2xl border ${t.border} ${t.inputBg} px-3.5 py-2.5 text-base sm:text-sm outline-none ${t.text}`} />
                   <button
                     type="button"
                     onClick={generateCustomSku}
-                    title="Auto-generate SKU"
-                    className={`tpd-click-press shrink-0 rounded-2xl border ${t.btnSecondary} px-3 py-2 text-xs font-semibold`}
+                    className={`tpd-click-press shrink-0 rounded-2xl border ${t.btnSecondary} px-3 py-2.5 text-xs font-semibold`}
                   >
                     Auto
                   </button>
@@ -5834,29 +6008,28 @@ export default function InventoryDashboard() {
               </div>
               <div>
                 <label className={`mb-1 block text-xs ${t.textMuted}`}>Size / Type</label>
-                <input value={form.size} onChange={(event) => setForm({ ...form, size: event.target.value })} className={`w-full rounded-2xl border ${t.border} ${t.inputBg} px-3.5 py-2 text-base sm:text-sm outline-none ${t.text}`} />
+                <input value={form.size} onChange={(event) => setForm({ ...form, size: event.target.value })} placeholder="M" className={`w-full rounded-2xl border ${t.border} ${t.inputBg} px-3.5 py-2.5 text-base sm:text-sm outline-none ${t.text}`} />
               </div>
               <div>
                 <label className={`mb-1 block text-xs ${t.textMuted}`}>Stock</label>
-                <input type="number" value={form.stock} onChange={(event) => setForm({ ...form, stock: event.target.value })} className={`w-full rounded-2xl border ${t.border} ${t.inputBg} px-3.5 py-2 text-base sm:text-sm tabular-nums outline-none ${t.text}`} />
-              </div>
-              <div>
-                <label className={`mb-1 block text-xs ${t.textMuted}`}>Min Stock</label>
-                <input type="number" value={form.min} onChange={(event) => setForm({ ...form, min: event.target.value })} className={`w-full rounded-2xl border ${t.border} ${t.inputBg} px-3.5 py-2 text-base sm:text-sm tabular-nums outline-none ${t.text}`} />
+                <input type="number" value={form.stock} onChange={(event) => setForm({ ...form, stock: event.target.value })} className={`w-full rounded-2xl border ${t.border} ${t.inputBg} px-3.5 py-2.5 text-base sm:text-sm tabular-nums outline-none ${t.text}`} />
               </div>
               <div className="sm:col-span-2">
-                <div className="flex items-center justify-between gap-2 mb-2">
-                  <label className={`block text-xs ${t.textMuted}`}>Colors</label>
+                <label className={`mb-1 block text-xs ${t.textMuted}`}>Min Stock</label>
+                <input type="number" value={form.min} onChange={(event) => setForm({ ...form, min: event.target.value })} className={`w-full rounded-2xl border ${t.border} ${t.inputBg} px-3.5 py-2.5 text-base sm:text-sm tabular-nums outline-none ${t.text}`} />
+              </div>
+              <div className="sm:col-span-2">
+                <div className="mb-1.5 flex items-center justify-between gap-2">
+                  <label className={`text-xs ${t.textMuted}`}>Colors</label>
                   <button
                     type="button"
-                    onClick={togglePickerAnimated}
+                    onClick={togglePicker}
                     className={`tpd-click-press inline-flex items-center gap-1.5 rounded-full border ${t.btnSecondary} px-3 py-1 text-xs font-semibold`}
                   >
                     <Palette size={13} />
-                    <span>{isPickerOpen ? 'Hide Wheel' : 'Color Wheel'}</span>
+                    <span>{isPickerOpen ? 'Hide Custom Color' : 'Custom Color'}</span>
                   </button>
                 </div>
-
                 <div className="flex flex-wrap gap-2">
                   {allSelectableColors.map((color) => {
                     const active = form.colors.includes(color);
@@ -5865,9 +6038,7 @@ export default function InventoryDashboard() {
                         key={color}
                         type="button"
                         onClick={() => toggleColor(color)}
-                        className={`group flex items-center gap-2 rounded-full border px-3 py-1.5 text-xs font-medium ${
-                          active ? t.tabActive : t.tabInactive
-                        }`}
+                        className={`group flex items-center gap-1.5 rounded-full border px-3 py-1.5 text-xs font-medium ${active ? t.tabActive : t.tabInactive}`}
                       >
                         <ColorCircle color={color} size="sm" />
                         <span>{color}</span>
@@ -5879,65 +6050,65 @@ export default function InventoryDashboard() {
                 {isPickerOpen && (
                   <div
                     ref={customColorPanelRef}
-                    className={`${isPickerClosing ? 'tpd-pop-exit' : 'tpd-pop-enter'} mt-3 rounded-2xl border ${t.border} ${t.cardBg3} p-3.5 space-y-3`}
+                    className={`tpd-slide-down mt-3 rounded-2xl border ${t.border} ${t.cardBg3} p-3.5 space-y-3`}
                   >
-                    <div className="flex items-center justify-between gap-2">
-                      <span className="text-xs font-bold">Color Wheel</span>
-                      <span className={`text-[11px] ${t.textMuted}`}>
-                        {previewSwatchName ? `Swatch: ${previewSwatchName}` : `Closest: ${currentMatchedName}`}
-                      </span>
-                    </div>
-
-                    <div className="grid grid-cols-6 gap-2">
+                    <div className="flex flex-wrap gap-1.5">
                       {FEATURED_SWATCHES.map((swatchName) => {
                         const swatchHex = getColorFill(swatchName);
-                        const isPicked = form.colors.includes(swatchName);
+                        const isCurrent =
+                          previewSwatchName === swatchName ||
+                          pickerHex.toLowerCase() === swatchHex.toLowerCase();
                         return (
                           <button
                             key={swatchName}
                             type="button"
-                            onClick={() => {
-                              handleQuickSwatchSelect(swatchName);
-                              toggleColor(swatchName);
-                            }}
+                            onClick={() => handleQuickSwatchSelect(swatchName)}
                             title={swatchName}
-                            className={`tpd-click-press flex flex-col items-center gap-1 rounded-xl border p-1.5 text-[10px] ${
-                              isPicked ? t.tabActive : t.tabInactive
+                            aria-label={swatchName}
+                            className={`tpd-click-press h-6 w-6 rounded-full border transition-transform duration-100 hover:scale-110 ${
+                              isCurrent
+                                ? 'ring-2 ring-sky-400 scale-110 border-white'
+                                : 'border-zinc-500/50'
                             }`}
-                          >
-                            <span
-                              className="h-5 w-5 rounded-full border border-black/40"
-                              style={{ backgroundColor: swatchHex }}
-                            />
-                            <span className="truncate w-full text-center">{swatchName}</span>
-                          </button>
+                            style={{ backgroundColor: swatchHex }}
+                          />
                         );
                       })}
                     </div>
 
                     <div
+                      role="slider"
+                      tabIndex={0}
+                      aria-label="Color saturation and brightness"
+                      aria-valuemin={0}
+                      aria-valuemax={100}
+                      aria-valuenow={Math.round(sat * 100)}
                       onPointerDown={(e) => {
-                        const rect = e.currentTarget.getBoundingClientRect();
-                        updateSvFromPointer(e.clientX, e.clientY, rect);
-                        const onMove = (moveEvent: PointerEvent) => {
-                          updateSvFromPointer(moveEvent.clientX, moveEvent.clientY, rect);
-                        };
-                        const onUp = () => {
-                          window.removeEventListener('pointermove', onMove);
-                          window.removeEventListener('pointerup', onUp);
-                        };
-                        window.addEventListener('pointermove', onMove);
-                        window.addEventListener('pointerup', onUp);
+                        e.currentTarget.setPointerCapture(e.pointerId);
+                        updateSvFromPointer(e.clientX, e.clientY, e.currentTarget.getBoundingClientRect());
                       }}
-                      className="relative h-28 w-full cursor-crosshair rounded-xl border border-white/20 overflow-hidden touch-none"
-                      style={{
-                        backgroundColor: currentHueHex,
-                        backgroundImage:
-                          'linear-gradient(to right, #ffffff, rgba(255,255,255,0)), linear-gradient(to top, #000000, rgba(0,0,0,0))',
+                      onPointerMove={(e) => {
+                        if (e.buttons === 1 || e.pointerType === 'touch') {
+                          updateSvFromPointer(e.clientX, e.clientY, e.currentTarget.getBoundingClientRect());
+                        }
                       }}
+                      className="relative h-32 w-full cursor-crosshair touch-none select-none rounded-xl border border-zinc-500/40 overflow-hidden"
+                      style={{ backgroundColor: currentHueHex }}
                     >
                       <div
-                        className="pointer-events-none absolute h-4 w-4 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-white shadow-md"
+                        className="absolute inset-0"
+                        style={{
+                          background: 'linear-gradient(to right, #ffffff, rgba(255,255,255,0))',
+                        }}
+                      />
+                      <div
+                        className="absolute inset-0"
+                        style={{
+                          background: 'linear-gradient(to top, #000000, rgba(0,0,0,0))',
+                        }}
+                      />
+                      <div
+                        className="pointer-events-none absolute h-4 w-4 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-white shadow-[0_0_0_1.5px_rgba(0,0,0,0.75)]"
                         style={{
                           left: `${sat * 100}%`,
                           top: `${(1 - val) * 100}%`,
@@ -5946,74 +6117,42 @@ export default function InventoryDashboard() {
                       />
                     </div>
 
-                    <div className="space-y-1">
-                      <div className="flex items-center justify-between text-[11px]">
-                        <span className={t.textMuted}>Hue</span>
-                        <span className="tabular-nums font-semibold">{Math.round(hue)}°</span>
-                      </div>
-                      <input
-                        type="range"
-                        min={0}
-                        max={360}
-                        value={Math.round(hue)}
-                        onChange={(e) => updateHueFromValue(Number(e.target.value))}
-                        aria-label="Hue"
-                        className="h-2.5 w-full cursor-pointer appearance-none rounded-full"
-                        style={{
-                          background:
-                            'linear-gradient(to right, #ff0000 0%, #ffff00 17%, #00ff00 33%, #00ffff 50%, #0000ff 67%, #ff00ff 83%, #ff0000 100%)',
-                        }}
-                      />
-                    </div>
+                    <input
+                      type="range"
+                      min={0}
+                      max={360}
+                      value={Math.round(hue)}
+                      onChange={(e) => updateHueFromValue(Number(e.target.value))}
+                      aria-label="Hue slider"
+                      className="tpd-hue-slider w-full cursor-pointer"
+                    />
 
-                    <div className="flex items-center justify-between gap-2 pt-1">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
                       <div className="flex items-center gap-2 min-w-0">
                         <span
-                          className="h-7 w-7 rounded-full border border-black/40 shrink-0"
+                          className="h-6 w-6 shrink-0 rounded-full border border-zinc-500/50"
                           style={{ backgroundColor: pickerHex }}
                         />
-                        <input
-                          value={pickerHex}
-                          onChange={(e) => {
-                            const raw = e.target.value.toUpperCase();
-                            setPickerHex(raw);
-                            setPreviewSwatchName(null);
-                            const rgb = hexToRgb(raw);
-                            if (rgb) {
-                              const hsv = rgbToHsv(rgb.r, rgb.g, rgb.b);
-                              setHue(hsv.h);
-                              setSat(hsv.s);
-                              setVal(hsv.v);
-                            }
-                          }}
-                          aria-label="Hex color value"
-                          className={`w-24 rounded-xl border ${t.border} ${t.inputBg} px-2.5 py-1 text-base sm:text-xs font-mono uppercase outline-none ${t.text}`}
-                        />
-                        <span className={`text-xs font-medium truncate ${t.textMuted}`}>
-                          {previewSwatchName || currentMatchedName}
+                        <span className="text-xs font-bold truncate">
+                          {previewSwatchName ?? currentMatchedName}
                         </span>
+                        <span className={`text-[11px] font-mono ${t.textMuted2}`}>{pickerHex}</span>
                       </div>
 
                       <div className="flex items-center gap-1.5 shrink-0">
                         <button
                           type="button"
-                          onClick={() => {
-                            addColorToForm(previewSwatchName || currentMatchedName);
-                            closePickerAnimated();
-                          }}
-                          className={`tpd-click-press rounded-xl border ${t.btnSecondary} px-2.5 py-1.5 text-xs font-semibold`}
+                          onClick={() => addColorToForm(previewSwatchName ?? currentMatchedName)}
+                          className={`tpd-click-press rounded-xl border ${t.btnSecondary} px-2.5 py-1 text-xs font-semibold`}
                         >
-                          + {previewSwatchName || currentMatchedName}
+                          + {previewSwatchName ?? currentMatchedName}
                         </button>
                         <button
                           type="button"
-                          onClick={() => {
-                            addColorToForm(pickerHex);
-                            closePickerAnimated();
-                          }}
-                          className={`tpd-click-press rounded-xl border ${t.btnPrimary} px-2.5 py-1.5 text-xs font-semibold`}
+                          onClick={() => addColorToForm(pickerHex)}
+                          className={`tpd-click-press rounded-xl border ${t.btnPrimary} px-2.5 py-1 text-xs font-semibold`}
                         >
-                          + Hex
+                          + {pickerHex}
                         </button>
                       </div>
                     </div>
@@ -6021,8 +6160,15 @@ export default function InventoryDashboard() {
                 )}
               </div>
             </div>
-            <div className="mt-6 flex justify-end gap-3">
-              <button onClick={closeModalAnimated} className={`rounded-2xl border ${t.border} ${t.btnSecondary} px-4 py-2 text-sm`}>Cancel</button>
+            <div className="mt-6 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={closeItemModal}
+                disabled={isSavingItem}
+                className={`rounded-2xl border ${t.border} ${t.btnSecondary} px-4 py-2 text-sm disabled:opacity-50`}
+              >
+                Cancel
+              </button>
               <button
                 type="button"
                 onClick={submitItem}
@@ -6034,14 +6180,184 @@ export default function InventoryDashboard() {
                     <Check size={16} strokeWidth={3} className={t.successText} />
                     <span>Saved</span>
                   </>
+                ) : isSavingItem ? (
+                  <>
+                    <img src="/icon.png" alt="" className="h-4 w-4 animate-spin object-contain" />
+                    <span>Saving...</span>
+                  </>
                 ) : (
-                  <span>{isSavingItem ? 'Saving...' : editingId ? 'Save Changes' : 'Create Item'}</span>
+                  <span>Save</span>
                 )}
               </button>
             </div>
           </div>
         </div>
       )}
+
+      <style jsx global>{`
+        .tpd-click-press {
+          transition: transform 110ms cubic-bezier(0.22, 1, 0.36, 1), background-color 140ms ease, border-color 140ms ease, box-shadow 140ms ease;
+          will-change: transform;
+        }
+        .tpd-click-press:active {
+          transform: scale(0.965);
+        }
+
+        @keyframes tpdSlideInTop {
+          from {
+            opacity: 0;
+            transform: translate3d(0, -14px, 0) scale(0.98);
+          }
+          to {
+            opacity: 1;
+            transform: translate3d(0, 0, 0) scale(1);
+          }
+        }
+        @keyframes tpdSlideOutTop {
+          from {
+            opacity: 1;
+            transform: translate3d(0, 0, 0) scale(1);
+          }
+          to {
+            opacity: 0;
+            transform: translate3d(0, -14px, 0) scale(0.98);
+          }
+        }
+        .tpd-slide-in-top {
+          animation: tpdSlideInTop 190ms cubic-bezier(0.22, 1, 0.36, 1) both;
+          will-change: transform, opacity;
+        }
+        .tpd-slide-out-top {
+          animation: tpdSlideOutTop 160ms cubic-bezier(0.4, 0, 1, 1) both;
+          will-change: transform, opacity;
+        }
+
+        @keyframes tpdSlideInRight {
+          from {
+            opacity: 0;
+            transform: translate3d(16px, 0, 0) scale(0.98);
+          }
+          to {
+            opacity: 1;
+            transform: translate3d(0, 0, 0) scale(1);
+          }
+        }
+        .tpd-slide-in-right {
+          animation: tpdSlideInRight 190ms cubic-bezier(0.22, 1, 0.36, 1) both;
+          will-change: transform, opacity;
+        }
+
+        @keyframes tpdSlideDown {
+          from {
+            opacity: 0;
+            transform: translate3d(0, -6px, 0);
+          }
+          to {
+            opacity: 1;
+            transform: translate3d(0, 0, 0);
+          }
+        }
+        .tpd-slide-down {
+          animation: tpdSlideDown 150ms cubic-bezier(0.22, 1, 0.36, 1) both;
+          will-change: transform, opacity;
+        }
+
+        @keyframes tpdFadeIn {
+          from {
+            opacity: 0;
+          }
+          to {
+            opacity: 1;
+          }
+        }
+        @keyframes tpdModalEnter {
+          from {
+            opacity: 0;
+            transform: translate3d(0, 10px, 0) scale(0.985);
+          }
+          to {
+            opacity: 1;
+            transform: translate3d(0, 0, 0) scale(1);
+          }
+        }
+        .tpd-fade-in {
+          animation: tpdFadeIn 130ms ease-out both;
+        }
+        .tpd-modal-enter {
+          animation: tpdModalEnter 170ms cubic-bezier(0.22, 1, 0.36, 1) both;
+          will-change: transform, opacity;
+        }
+
+        .tpd-hue-slider {
+          -webkit-appearance: none;
+          appearance: none;
+          height: 12px;
+          border-radius: 9999px;
+          background: linear-gradient(
+            to right,
+            #ff0000 0%,
+            #ffff00 17%,
+            #00ff00 33%,
+            #00ffff 50%,
+            #0000ff 67%,
+            #ff00ff 83%,
+            #ff0000 100%
+          );
+          border: 1px solid rgba(113, 113, 122, 0.45);
+        }
+        .tpd-hue-slider::-webkit-slider-thumb {
+          -webkit-appearance: none;
+          appearance: none;
+          width: 16px;
+          height: 16px;
+          border-radius: 9999px;
+          background: #ffffff;
+          border: 2px solid #09090b;
+          box-shadow: 0 1px 4px rgba(0, 0, 0, 0.45);
+          cursor: pointer;
+        }
+        .tpd-hue-slider::-moz-range-thumb {
+          width: 16px;
+          height: 16px;
+          border-radius: 9999px;
+          background: #ffffff;
+          border: 2px solid #09090b;
+          box-shadow: 0 1px 4px rgba(0, 0, 0, 0.45);
+          cursor: pointer;
+        }
+
+        @media (prefers-reduced-motion: reduce) {
+          .tpd-click-press,
+          .tpd-slide-in-top,
+          .tpd-slide-out-top,
+          .tpd-slide-in-right,
+          .tpd-slide-down,
+          .tpd-fade-in,
+          .tpd-modal-enter {
+            animation: none !important;
+            transition: none !important;
+          }
+        }
+      `}</style>
     </main>
+  );
+}
+
+function CopyIcon({ size = 14 }: { size?: number }) {
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
+      <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+    </svg>
   );
 }
